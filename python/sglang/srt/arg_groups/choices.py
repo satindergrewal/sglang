@@ -38,6 +38,7 @@ QUANTIZATION_CHOICES = [
     "awq",
     "fp8",  # MOE + linear online quantization.
     "mxfp8",  # MOE + linear online quantization.
+    "exl3",  # turboderp EXL3 trellis packs (dense linears + quantized lm_head).
     "gptq",
     "gptq_marlin",
     "awq_marlin",

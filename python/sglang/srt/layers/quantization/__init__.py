@@ -19,6 +19,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.exl3 import ExL3Config
 from sglang.srt.layers.quantization.gguf import GGUFConfig
 from sglang.srt.layers.quantization.gptq import (
     CPUGPTQConfig,
@@ -98,6 +99,7 @@ if is_cpu() or is_cuda() or _is_gfx95_supported or is_xpu():
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,
+            "exl3": ExL3Config,
         }
     )
 

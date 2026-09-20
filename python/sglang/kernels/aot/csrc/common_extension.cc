@@ -381,6 +381,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "es_sm100_mxfp8_blockscaled_grouped_quant(Tensor input, Tensor problem_sizes, Tensor expert_offsets, Tensor "
       "blockscale_offsets, Tensor quant_output, Tensor scale_factor) -> () ");
   m.impl("es_sm100_mxfp8_blockscaled_grouped_quant", &es_sm100_mxfp8_blockscaled_grouped_quant);
+
+  m.def("sgl_exl3_had_in(Tensor x, Tensor suh, Tensor(a!) out) -> ()");
+  m.impl("sgl_exl3_had_in", torch::kCUDA, &sgl_exl3_had_in);
+
+  m.def("sgl_exl3_linear(Tensor x_had, Tensor packed, Tensor svh, Tensor? bias, int cb, Tensor(a!) out) -> ()");
+  m.impl("sgl_exl3_linear", torch::kCUDA, &sgl_exl3_linear);
 }
 
 REGISTER_EXTENSION(common_ops)

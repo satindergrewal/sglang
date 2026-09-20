@@ -274,6 +274,9 @@ set(SOURCES
     "csrc/gemm/per_token_group_quant_8bit.cu"
     "csrc/gemm/per_token_group_quant_8bit_v2.cu"
     "csrc/gemm/per_token_quant_fp8.cu"
+
+    "csrc/exl3/exl3_linear.cu"
+
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
     "csrc/infllm_v2/max_pooling.cu"

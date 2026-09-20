@@ -783,3 +783,15 @@ std::vector<at::Tensor> fwd_kvcache_mla_fp8(
 
 std::vector<at::Tensor> get_mla_decoding_metadata_dense_fp8(
     at::Tensor& seqlens_k, const int64_t num_heads_per_head_k, const int64_t num_heads_k);
+
+// EXL3 (turboderp EXL3 / ExLlamaV3 trellis format) dense linear path.
+// Decode math ported under MIT from ExLlamaV3 exllamav3_ext/quant
+// (see csrc/exl3/exl3_decode.cuh for the per-file license).
+void sgl_exl3_had_in(at::Tensor x, at::Tensor suh, at::Tensor out);
+void sgl_exl3_linear(
+    at::Tensor x,                // (m, k) fp16, Hadamard-transformed
+    at::Tensor packed,           // (k16, n16, 16*bits) int16
+    at::Tensor svh,              // (n,) fp16
+    c10::optional<at::Tensor> bias,  // (n,) fp16 or none
+    int64_t cb,                  // 0 = 3inst (no marker), 1 = mcg, 2 = mul1
+    at::Tensor out);             // (m, n) fp16
