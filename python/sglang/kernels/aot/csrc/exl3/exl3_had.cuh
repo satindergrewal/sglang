@@ -5,6 +5,9 @@
 //   turboderp's ExLlamaV3 hadamard_inner.cuh (MIT, (c) 2025 turboderp);
 //   normalization is 1/sqrt(128) after the last stage, matching the PyTorch
 //   reference (fp32 Hadamard, fp16 round, then fp16 elementwise svh / bias).
+// - Lineage note: this file borrows only turboderp's butterfly structure;
+//   the cuda-exl3 (MIT) lessons (M-tiling, fragment decode) are cited where
+//   they are actually used — exl3_linear.cu and exl3_decode.cuh.
 // - Independent: the warp-level implementation and host wrappers were
 //   written for SGLang.
 //
