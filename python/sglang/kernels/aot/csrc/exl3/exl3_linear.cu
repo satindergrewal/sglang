@@ -223,9 +223,29 @@ __global__ void exl3_gemm_kernel(
         for (int j = 0; j < 4; j++)
         {
             const int col = n_base + lane + 32 * j;
-            half h = __float2half_rn(v[j] * kRScale);
-            h = __hmul(h, g_svh[col]);
-            if (g_bias) h = __hadd(h, g_bias[col]);
+            float fv = v[j] * kRScale;
+            // Numerics-only epilogue guard: saturate past fp16 range instead of
+            // letting the fp16 stores overflow to inf. Tight-calibration
+            // checkpoints (the DFlash2 drafter's down_proj moves a base outlier
+            // into a ~10x svh pivot, pushing worst-case output dots past 65504
+            // AFTER the svh multiply) poison the decode with inf -> NaN
+            // otherwise. Each fp16 stage is replaced by its exact fp32
+            // product/sum + one RTNE round + saturate: fp16->fp32 is lossless,
+            // an fp16*fp16 product and (up to 24-bit mantissa) an fp16+fp16 sum
+            // are exact in fp32, so in-range values round bit-identically to
+            // __float2half_rn/__hmul/__hadd and only past-range values change
+            // (inf -> +-65504). The on-disk decode format is untouched.
+            if (fv > 65504.f) fv = 65504.f; else if (fv < -65504.f) fv = -65504.f;
+            half h = __float2half_rn(fv);
+            float p = __half2float(h) * __half2float(g_svh[col]);
+            if (p > 65504.f) p = 65504.f; else if (p < -65504.f) p = -65504.f;
+            h = __float2half_rn(p);
+            if (g_bias)
+            {
+                float b = __half2float(h) + __half2float(g_bias[col]);
+                if (b > 65504.f) b = 65504.f; else if (b < -65504.f) b = -65504.f;
+                h = __float2half_rn(b);
+            }
             g_out[row_ep * n + col] = h;
         }
     }

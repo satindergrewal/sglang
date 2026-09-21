@@ -29,6 +29,8 @@ _is_hip = is_hip()
 _GLM_DSA_MODEL_ARCHS = (
     "GlmMoeDsaForCausalLM",
     "GlmMoeDsaForCausalLMNextN",
+    # GLM-5.3-Flash: qk_rope_head_dim=0 DSA; the only sm120 sparse-MLA path.
+    "Glm5NextForConditionalGeneration",
 )
 
 # Page layout constants for DSv4-Flash (MODEL1):

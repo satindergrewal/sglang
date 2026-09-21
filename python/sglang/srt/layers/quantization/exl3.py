@@ -20,14 +20,18 @@
 # notice accordingly. This file has no exllamav3 imports and no new
 # dependencies: the decoder is pure PyTorch.
 #
-# v1 scope (dense checkpoints, TP=1):
-#   - dequant-on-apply: weights stay packed on GPU; each forward materializes
-#     the fp16 weight per matrix, uses it, and frees it. Correct but slow
-#     decode; Phase 3 replaces apply() with the native CUDA trellis kernel.
-#   - quantized lm_head dequantizes once at load (2.5 GB fp16 for the
-#     27B-class vocab) so logits stay a plain GEMM.
-#   - the vision tower and plain modules (in_proj_ba, conv1d, embeddings)
-#     stay unquantized. MoE routed experts are out of scope for v1 (Phase 3.5).
+# v1 scope (TP=1 / EP=1):
+#   - dense: dequant-on-apply with the native CUDA trellis GEMM (fast path) or
+#     the pure-torch fallback (EXL3_NO_KERNEL=1); Phase 3 tunes the kernel.
+#   - MoE: per-expert trellis packs are stashed at load and dequantized once in
+#     process_weights_after_loading into fused fp16 w13/w2 expert weights, run
+#     by the standard Triton fused-MoE runner. Phase 3.5 replaces this with the
+#     packed-trellis grouped GEMM (fp16 materialization is O(4.6x) the pack).
+#   - mixed checkpoints (GLM r7 "non_routed_dtype_policy": "official_source_native"
+#     — only routed experts are trellis-packed): modules whose tensors arrive as
+#     plain native `.weight` fall back to an unquantized linear transparently.
+#   - quantized lm_head dequantizes once at load so logits stay a plain GEMM;
+#     native (unquantized) lm_heads load through the same plain path.
 from __future__ import annotations
 
 import logging
@@ -40,6 +44,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
@@ -371,6 +376,13 @@ class ExL3Config(QuantizationConfig):
             return UnquantizedLinearMethod()
         if "embed_tokens" in prefix:
             return None
+        # FusedMoE under EXL3 (lazy import: this module is imported by the
+        # quantization registry long before the MoE layer tree). isinstance
+        # first: the prefix is empty for bare FusedMoE constructions.
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        if isinstance(layer, FusedMoE):
+            return ExL3MoEMethod(self)
         if isinstance(layer, ParallelLMHead):
             return ExL3HeadMethod(self)
         if isinstance(layer, RadixAttention):
@@ -438,16 +450,50 @@ class ExL3LinearMethod(LinearMethodBase):
     ):
         layer._exl3_output_sizes = list(output_partition_sizes)
         layer._exl3_records = {}
+        layer._exl3_plain = {}
         for suffix in _EXL3_PARAMS:
             p = Parameter(torch.empty(0, dtype=_PARAM_DTYPES[suffix]), requires_grad=False)
             p.weight_loader = self._make_loader(layer, suffix)
             layer.register_parameter(suffix, p)
+        # Mixed-checkpoint support (GLM r7 non_routed_dtype_policy =
+        # official_source_native: only routed experts are trellis-packed).
+        # Plain `.weight` tensors materialize INTO this param immediately on
+        # first arrival — post-load hooks (the Deepseek MLA w_kc/w_vc split in
+        # DeepseekV2WeightLoaderMixin.post_load_weights) read layer.weight
+        # directly during load_weights, before process_weights_after_loading.
+        # Quantized modules never receive a `.weight` tensor, so the param
+        # stays 0-size and costs nothing.
+        w = Parameter(torch.empty(0, dtype=params_dtype), requires_grad=False)
+        w.weight_loader = self._make_plain_loader(
+            layer, sum(output_partition_sizes), input_size_per_partition,
+            list(output_partition_sizes),
+        )
+        layer.register_parameter("weight", w)
 
     @staticmethod
     def _make_loader(layer: torch.nn.Module, suffix: str):
         def loader(param, loaded_weight, shard_id=None):
             rec = layer._exl3_records.setdefault(suffix, {})
             rec.setdefault(shard_id, []).append(loaded_weight)
+
+        return loader
+
+    @staticmethod
+    def _make_plain_loader(layer: torch.nn.Module, out_total: int, in_size: int,
+                           output_partition_sizes: List[int]):
+        def loader(param, loaded_weight, shard_id=None):
+            layer._exl3_plain.setdefault(shard_id, []).append(loaded_weight)
+            w = layer.weight
+            if w.numel() == 0:
+                w = Parameter(
+                    torch.empty(out_total, in_size, dtype=loaded_weight.dtype,
+                                device="cuda"),
+                    requires_grad=False,
+                )
+                layer.weight = w
+            idx = _shard_first_index(shard_id)
+            off = sum(output_partition_sizes[:idx])
+            w.data[off:off + loaded_weight.shape[0]].copy_(loaded_weight)
 
         return loader
 
@@ -459,10 +505,18 @@ class ExL3LinearMethod(LinearMethodBase):
         suh_by = recs.get("suh", {})
         svh_by = recs.get("svh", {})
         if not trellis_by:
-            raise RuntimeError(
-                "exl3: no trellis tensors arrived for this layer; legacy .su/.sv "
-                "sign-bitfield packs are not supported"
-            )
+            # Mixed checkpoint: this module's tensors arrived as plain native
+            # weights (already materialized into layer.weight by the loader).
+            layer._exl3_groups = []
+            layer._exl3_plain = {}
+            layer._exl3_records = {}
+            if layer.weight.numel() == 0:
+                raise RuntimeError(
+                    "exl3: no trellis tensors and no plain weights arrived for "
+                    f"{type(layer).__name__}; legacy .su/.sv sign-bitfield packs "
+                    "are not supported"
+                )
+            return
         sizes = layer._exl3_output_sizes
         groups = []
         for shard_id in trellis_by:
@@ -505,6 +559,9 @@ class ExL3LinearMethod(LinearMethodBase):
     def apply(self, layer: torch.nn.Module, x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         x_shape = x.shape
+        if not getattr(layer, "_exl3_groups", None):
+            # Mixed-checkpoint plain module: native weight, native GEMM.
+            return F.linear(x, layer.weight, bias)
         x2 = x.reshape(-1, x_shape[-1]).to(torch.float16).contiguous()
         used_kernel = False
         if self._kernel_available() and layer._exl3_groups:
@@ -534,28 +591,15 @@ class ExL3LinearMethod(LinearMethodBase):
 class ExL3HeadMethod(ExL3LinearMethod):
     """Quantized lm_head: EXL3 params at load, dequanted ONCE at
     process_weights_after_loading into a plain fp16 weight, so logits stay a
-    plain GEMM (the 27B-class head materialization is ~2.5 GB fp16)."""
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: List[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        super().create_weights(layer, input_size_per_partition, output_partition_sizes,
-                               input_size, output_size, params_dtype, **extra_weight_attrs)
-        weight = Parameter(
-            torch.empty(sum(output_partition_sizes), input_size_per_partition,
-                        dtype=torch.float16),
-            requires_grad=False,
-        )
-        layer.register_parameter("weight", weight)
+    plain GEMM (the 27B-class head materialization is ~2.5 GB fp16). Native
+    (unquantized) lm_heads — GLM r7 stores lm_head.weight plain — load through
+    the base plain-stash path unchanged."""
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not layer._exl3_records.get("trellis", {}):
+            # Plain native head: base materializes layer.weight from the stash.
+            super().process_weights_after_loading(layer)
+            return
         super().process_weights_after_loading(layer)
         g = layer._exl3_groups
         if len(g) != 1:
@@ -566,6 +610,11 @@ class ExL3HeadMethod(ExL3LinearMethod):
         # 128 columns, so 128-aligned column chunks are bit-identical while
         # bounding the fp32 intermediates of the preapply chain.
         vocab = svh.shape[0]
+        in_dim = suh.shape[0]
+        layer.weight = Parameter(
+            torch.empty(vocab, in_dim, dtype=torch.float16, device="cuda"),
+            requires_grad=False,
+        )
         chunk = 8192
         for start in range(0, vocab, chunk):
             end = min(start + chunk, vocab)
@@ -583,3 +632,196 @@ class ExL3HeadMethod(ExL3LinearMethod):
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_, layer.weight)
+
+
+class ExL3MoEMethod(FusedMoEMethodBase):
+    """EXL3 routed experts on FusedMoE.
+
+    Per-expert trellis packs arrive as fused-module params w13_{trellis,suh,...}
+    / w2_{...} (the model's expert_params_mapping replaces
+    ``experts.<e>.<proj>.<suffix>`` with ``experts.w13_<suffix>`` /
+    ``experts.w2_<suffix>``), are stashed per (expert_id, prefix, shard_id,
+    suffix) by the loader, and are dequantized ONCE in
+    process_weights_after_loading into fused fp16 w13/w2 expert weights run by
+    the standard Triton fused-MoE runner — the same numerics path as
+    unquantized MoE. Mixed-expert checkpoints (routed experts quantized, shared
+    expert native — GLM r7) materialize plain expert tensors through the same
+    path: gate/up stacked to (2I, H), down kept (H, I).
+
+    Memory note: this materializes every local expert at params_dtype — for a
+    288-expert GLM-5.3 layer that is ~14.5 GB fp16 versus ~3.2 GB packed.
+    Validation-scale only; Phase 3.5 replaces it with the packed-trellis
+    grouped GEMM (weights stay packed on GPU, R2 design).
+
+    TP/EP: experts load whole; TP > 1 or EP > 1 is rejected for now.
+    """
+
+    def __init__(self, config: ExL3Config):
+        super().__init__()
+        self.config = config
+        self.with_bias = False
+        self.moe_runner_config = None
+        self.hidden_size = None
+        self.intermediate_size = None
+        self.params_dtype = None
+
+    # -- parameters ---------------------------------------------------------
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        with_bias: bool = False,
+        **extra_weight_attrs,
+    ):
+        self.with_bias = with_bias
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size_per_partition
+        self.params_dtype = params_dtype
+        layer._exl3_moe_records = {}
+        for prefix in ("w13", "w2"):
+            for suffix in _EXL3_PARAMS:
+                p = Parameter(
+                    torch.empty(0, dtype=_PARAM_DTYPES[suffix]), requires_grad=False
+                )
+                p.weight_loader = self._make_expert_loader(layer, prefix, suffix)
+                layer.register_parameter(f"{prefix}_{suffix}", p)
+        # Plain-expert fallback targets: unquantized expert tensors
+        # (`experts.<e>.<proj>.weight`, e.g. the fused shared expert) map here
+        # through the same expert_params_mapping replace, and are materialized
+        # in process_weights_after_loading alongside trellis experts.
+        for prefix in ("w13", "w2"):
+            p = Parameter(torch.empty(0, dtype=params_dtype), requires_grad=False)
+            p.weight_loader = self._make_expert_loader(layer, prefix, "weight")
+            layer.register_parameter(f"{prefix}_weight", p)
+
+    @staticmethod
+    def _make_expert_loader(layer: torch.nn.Module, prefix: str, suffix: str):
+        def loader(param, loaded_weight, weight_name=None, shard_id=None,
+                   expert_id=None):
+            if expert_id is None:
+                raise RuntimeError(
+                    "exl3 MoE: expert weights must arrive with an expert_id"
+                )
+            key = (expert_id, prefix, shard_id, suffix)
+            layer._exl3_moe_records.setdefault(key, []).append(loaded_weight)
+
+        return loader
+
+    # -- post-processing -----------------------------------------------------
+
+    @torch.no_grad()
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if layer.moe_ep_size != 1 or layer.moe_tp_size != 1:
+            raise NotImplementedError(
+                "exl3 MoE: TP/EP sharding of packed trellis experts is not "
+                "supported yet; run with tp=1 ep=1"
+            )
+        recs = layer._exl3_moe_records
+        E = layer.num_local_experts
+        I = self.intermediate_size
+        H = self.hidden_size
+        dt = self.params_dtype
+        dev = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        gated = self.moe_runner_config.is_gated if self.moe_runner_config else True
+        w13_n = 2 * I if gated else I
+        w13 = torch.empty((E, w13_n, H), dtype=dt, device=dev)
+        w2 = torch.empty((E, H, I), dtype=dt, device=dev)
+
+        def get(e, prefix, shard, suffix):
+            lst = recs.get((e, prefix, shard, suffix))
+            return lst[0] if lst else None
+
+        def cb_of(e, prefix, shard):
+            mul1 = get(e, prefix, shard, "mul1")
+            mcg = get(e, prefix, shard, "mcg")
+            codebook = _sentinel_to_codebook(mul1 if mul1 is not None else mcg)
+            if codebook == "default":
+                raise ValueError(
+                    "exl3 MoE: expert matrix without codebook marker; only "
+                    "mul1/mcg packs are supported in v1"
+                )
+            return codebook
+
+        def deq(trellis, suh, svh, codebook):
+            return dequant_matrix_orig(
+                trellis.to(dev, non_blocking=True), suh.to(dev, non_blocking=True),
+                svh.to(dev, non_blocking=True), codebook,
+            )  # (K, N) fp16
+
+        for e in range(E):
+            gt = get(e, "w13", "w1", "trellis")
+            dtt = get(e, "w2", "w2", "trellis")
+            if gt is not None:
+                if dtt is None or get(e, "w13", "w3", "trellis") is None:
+                    raise RuntimeError(f"exl3 MoE: expert {e} has partial trellis set")
+                gw = deq(gt, get(e, "w13", "w1", "suh"), get(e, "w13", "w1", "svh"),
+                         cb_of(e, "w13", "w1"))  # (H, I)
+                uw = deq(get(e, "w13", "w3", "trellis"), get(e, "w13", "w3", "suh"),
+                         get(e, "w13", "w3", "svh"), cb_of(e, "w13", "w3"))
+                dw = deq(dtt, get(e, "w2", "w2", "suh"), get(e, "w2", "w2", "svh"),
+                         cb_of(e, "w2", "w2"))  # (I, H)
+                w13[e] = torch.cat(
+                    [gw.t(), *( [uw.t()] if gated else [] )], dim=0
+                ).to(dt)
+                w2[e] = dw.t().to(dt)
+            else:
+                # Plain native expert (fused shared expert / mixed checkpoint).
+                gp = get(e, "w13", "w1", "weight")
+                up = get(e, "w13", "w3", "weight")
+                dp = get(e, "w2", "w2", "weight")
+                if dp is None or (gp is None and (not gated or up is None)):
+                    raise RuntimeError(
+                        f"exl3 MoE: expert {e} has neither trellis nor plain tensors"
+                    )
+                w13[e] = torch.cat(
+                    [gp, *( [up] if gated else [] )], dim=0
+                ).to(dt) if gated else gp.to(dt)
+                w2[e] = dp.to(dt)
+            # Free this expert's stashed pieces (packed CPU/GPU refs).
+            for k in [k for k in recs if k[0] == e]:
+                del recs[k]
+        layer._exl3_moe_records = {}
+        layer.w13_weight = Parameter(w13, requires_grad=False)
+        layer.w2_weight = Parameter(w2, requires_grad=False)
+        # EXL3 per-matrix biases fold into per-expert fp32 bias vectors.
+        gb = [get(e, "w13", "w1", "bias") for e in range(E)]
+        ub = [get(e, "w13", "w3", "bias") for e in range(E)]
+        db = [get(e, "w2", "w2", "bias") for e in range(E)]
+        if any(b is not None for b in gb + ub + db):
+            b13 = torch.zeros((E, w13_n), dtype=torch.float32, device=dev)
+            b2 = torch.zeros((E, H), dtype=torch.float32, device=dev)
+            for e in range(E):
+                if gb[e] is not None:
+                    b13[e, :I] = gb[e].to(dev).float()
+                if gated and ub[e] is not None:
+                    b13[e, I:] = ub[e].to(dev).float()
+                if db[e] is not None:
+                    b2[e] = db[e].to(dev).float()
+            layer.w13_weight_bias = Parameter(b13, requires_grad=False)
+            layer.w2_weight_bias = Parameter(b2, requires_grad=False)
+        torch.cuda.empty_cache()
+
+    # -- runner --------------------------------------------------------------
+
+    def create_moe_runner(self, layer: torch.nn.Module, moe_runner_config):
+        from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
+
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+
+    def get_triton_quant_info(self, layer: torch.nn.Module):
+        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+
+        return TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            b13=getattr(layer, "w13_weight_bias", None),
+            b2=getattr(layer, "w2_weight_bias", None),
+        )
+
+    def apply(self, layer: torch.nn.Module, dispatch_output):
+        return self.runner.run(dispatch_output, self.get_triton_quant_info(layer))
