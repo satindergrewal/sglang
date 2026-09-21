@@ -582,6 +582,10 @@ class ExL3LinearMethod(LinearMethodBase):
                 W = dequant_matrix_orig(g["trellis"], g["suh"], g["svh"], g["codebook"])
                 outs.append(F.linear(x2, W.t()))
             y = outs[0] if len(outs) == 1 else torch.cat(outs, dim=-1)
+            # Same numerics-only guard as the kernel epilogue: tight-calibration
+            # checkpoints can produce final outputs past fp16 range, and the
+            # fp16 GEMM output store overflows to inf -> NaN identically.
+            y = torch.clamp(y.float(), -65504.0, 65504.0).to(torch.float16)
         gb = None if used_kernel else layer._exl3_gbias
         if gb is not None:
             y = y + gb.to(torch.float16)

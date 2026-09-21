@@ -731,6 +731,11 @@ def flashinfer_sparse_mla_forward(
     from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
     topk = indices.shape[1]
+    # Native qk_rope_head_dim=0 (GLM-5.3) requires per-request top-k lengths;
+    # the kpool tail append keeps them uniform (topk + kpool - 1).
+    top_k_lens = torch.full(
+        (indices.shape[0],), topk, dtype=torch.int32, device=indices.device
+    )
     result = trtllm_batch_decode_with_kv_cache_mla(
         query=q.unsqueeze(1),
         kv_cache=kv_cache.view(torch.uint8)
@@ -748,5 +753,6 @@ def flashinfer_sparse_mla_forward(
         bmm2_scale=1.0,
         kv_scale_format="arbitrary_fp32",
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        sparse_mla_top_k_lens=top_k_lens,
     )
     return result.squeeze(1)
