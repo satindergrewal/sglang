@@ -562,7 +562,19 @@ class ExL3LinearMethod(LinearMethodBase):
         if not getattr(layer, "_exl3_groups", None):
             # Mixed-checkpoint plain module: native weight, native GEMM.
             return F.linear(x, layer.weight, bias)
-        x2 = x.reshape(-1, x_shape[-1]).to(torch.float16).contiguous()
+        # bf16 x goes straight into had_in (converted in-kernel) — the fp16
+        # round-trip copy showed up as 0.5 ms/token of pure direct_copy in
+        # the decode profile. fp16 x is unchanged. The GEMM stays
+        # fp16-in/fp32-acc; output dtype follows x (see below).
+        if x.dtype == torch.bfloat16:
+            x2 = x.reshape(-1, x_shape[-1]).contiguous()
+        else:
+            x2 = x.reshape(-1, x_shape[-1]).to(torch.float16).contiguous()
+        # bf16 models get a bf16 GEMM output: the fp16 epilogue's 65504
+        # ceiling would saturate tight-calibration checkpoints whose outputs
+        # legitimately exceed fp16 range (the DFlash2 drafter; the vendor
+        # runs it in bf16). The GEMM itself stays fp16-in/fp32-acc.
+        out_dt = torch.bfloat16 if x.dtype == torch.bfloat16 else torch.float16
         used_kernel = False
         if self._kernel_available() and layer._exl3_groups:
             used_kernel = True
@@ -571,12 +583,14 @@ class ExL3LinearMethod(LinearMethodBase):
                 xh = torch.empty(x2.shape, dtype=torch.float16, device=x2.device)
                 torch.ops.sgl_kernel.sgl_exl3_had_in(x2, g["suh"], xh)
                 out_g = torch.empty((x2.shape[0], g["svh"].shape[0]),
-                                    dtype=torch.float16, device=x2.device)
+                                    dtype=out_dt, device=x2.device)
                 torch.ops.sgl_kernel.sgl_exl3_linear(xh, g["trellis"], g["svh"],
                                                      g["bias"], g["cb"], out_g)
                 outs.append(out_g)
             y = outs[0] if len(outs) == 1 else torch.cat(outs, dim=-1)
         else:
+            if x2.dtype != torch.float16:
+                x2 = x2.to(torch.float16)
             outs = []
             for g in layer._exl3_groups:
                 W = dequant_matrix_orig(g["trellis"], g["suh"], g["svh"], g["codebook"])

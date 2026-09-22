@@ -26,6 +26,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 #include <cstdint>
@@ -42,10 +43,10 @@ constexpr float kRScale = 0.088388347648f;  // 1 / sqrt(128)
 // One warp per (row, 128-input-chunk): elementwise suh -> fp16 round ->
 // natural-order butterfly (fp32) -> fp16 round with 1/sqrt(128) folded.
 __global__ void exl3_had_in_kernel(
-    const half* __restrict__ g_x,    // (m, k) fp16
+    const half* __restrict__ g_x,    // (m, k) fp16 or bf16
     const half* __restrict__ g_suh,  // (k,) fp16
     half* __restrict__ g_out,        // (m, k) fp16
-    int k)
+    int k, int x_bf16)
 {
     const int row = blockIdx.x;
     const int chunk = blockIdx.y * 8 + (threadIdx.x >> 5);  // 8 warps = 8 chunks
@@ -57,9 +58,16 @@ __global__ void exl3_had_in_kernel(
     for (int j = 0; j < 4; j++)
     {
         const int i = lane + 32 * j;
-        const half xv = g_x[row * k + base + i];
+        float xf;
+        if (x_bf16)
+            xf = __bfloat162float(
+                reinterpret_cast<const __nv_bfloat16 *>(g_x)[row * k + base + i]);
+        else
+            xf = __half2float(g_x[row * k + base + i]);
         const half sv = g_suh[base + i];
-        v[j] = __half2float(__hmul(xv, sv));  // fp16 product round, then fp32
+        // fp16 path: fp16 product round then fp32 (bit-identical to v1);
+        // bf16 path: exact fp32 product (bf16->fp32 is lossless).
+        v[j] = x_bf16 ? xf * __half2float(sv) : __half2float(__hmul(__float2half_rn(xf), sv));
     }
     had_warp_butterfly(v, lane);
     for (int j = 0; j < 4; j++)
@@ -108,8 +116,8 @@ __global__ void exl3_gemm_kernel(
     const uint16_t* __restrict__ g_packed, // (k16, n16, 16*BITS) le int16 words
     const half* __restrict__ g_svh,        // (n,) fp16
     const half* __restrict__ g_bias,       // (n,) fp16 or nullptr
-    half* __restrict__ g_out,              // (m, n) fp16
-    int m, int k, int n, int n16, int cb)
+    half* __restrict__ g_out,              // (m, n) fp16 or bf16
+    int m, int k, int n, int n16, int cb, int bf16_out)
 {
     constexpr int words16 = BITS * 16;   // uint16 words per 16x16 tile
     const int t = threadIdx.x;           // 256 = 8 warps
@@ -235,6 +243,17 @@ __global__ void exl3_gemm_kernel(
             // are exact in fp32, so in-range values round bit-identically to
             // __float2half_rn/__hmul/__hadd and only past-range values change
             // (inf -> +-65504). The on-disk decode format is untouched.
+            // bf16 output (out dtype bf16): no fp16 ceiling — the drafter's
+            // legitimately-large outputs (the vendor runs the drafter in bf16)
+            // store exactly, so the saturating guard is skipped entirely.
+            if (bf16_out)
+            {
+                float p = fv * __half2float(g_svh[col]);
+                if (g_bias) p += __half2float(g_bias[col]);
+                reinterpret_cast<__nv_bfloat16 *>(g_out)[row_ep * n + col] =
+                    __float2bfloat16_rn(p);
+                continue;
+            }
             if (fv > 65504.f) fv = 65504.f; else if (fv < -65504.f) fv = -65504.f;
             half h = __float2half_rn(fv);
             float p = __half2float(h) * __half2float(g_svh[col]);
@@ -255,11 +274,198 @@ __global__ void exl3_gemm_kernel(
 
 // ---------------------------------------------------------------------------
 
+namespace exl3 {
+
+// V2 decode-path GEMM (m <= 16). V1's grid gives n16/8 blocks (~136 on a
+// 17k-col matrix), each running a long serial k-loop: at one block per SM the
+// per-k-tile decode+MMA latency is fully exposed (measured 210us for a
+// 44.6MB matrix = ~212GB/s, vs ~500+GB/s for the exllamav3 bar). V2 splits K
+// across grid.y (2D grid = col_blocks x splits), shortening each block's
+// serial chain so sibling blocks hide the latency, batches each lane's
+// window-word loads before the decode chain, and stages fp32 partials in a
+// workspace. A separate reduce kernel sums the k-splits in fixed order
+// (deterministic) and applies the identical fused epilogue.
+template <int BITS, int BM>
+__global__ void exl3_gemm_kernel_v2(
+    const half* __restrict__ g_x,
+    const uint16_t* __restrict__ g_packed,
+    float* __restrict__ g_ws,          // (col_blocks, splits, m, n) fp32
+    int m, int k, int n, int n16, int cb, int splits)
+{
+    constexpr int words16 = BITS * 16;
+    const int t = threadIdx.x;
+    const int lane = t & 31;
+    const int warp = t >> 5;
+    const int col_block = blockIdx.x;
+    const int ks = blockIdx.y;
+    const int k16 = k >> 4;
+    const int k_beg = (int)((long)k16 * ks / splits);
+    const int k_end = (int)((long)k16 * (ks + 1) / splits);
+    if (k_beg >= k_end) return;
+    const int n_base = col_block * 128;
+
+    const int m0 = lane >> 2;
+    const int m8 = m0 + 8;
+    const bool v0 = m0 < m;
+    const bool v8 = m8 < m;
+    const int kp = (lane & 3) << 1;
+    const half* x0 = g_x + m0 * k;
+    const half* x8 = g_x + m8 * k;
+
+    constexpr int n_words = BITS * 256 / 32;
+    int wp0[8], wp1[8], ws0[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++)
+    {
+        const int e = lane * 8 + j;
+        const int b0 = e * BITS + BITS - 16 + 256 * BITS;
+        const int b1 = b0 + 16;
+        const int i0 = b0 / 32;
+        const int i1 = (b1 - 1) / 32;
+        wp0[j] = i0 % n_words;
+        wp1[j] = i1 % n_words;
+        ws0[j] = (i1 + 1) * 32 - b1;
+    }
+
+    FragC frag_c[2];
+    frag_c[0] = {};
+    frag_c[1] = {};
+
+    for (int kk = k_beg; kk < k_end; kk++)
+    {
+        const uint32_t* tile32 =
+            (const uint32_t*)(g_packed + ((kk * n16) + col_block * 8 + warp) * words16);
+
+        // Batch the lane's window-word loads (independent), then decode from
+        // registers — the v1 form re-enters memory inside each dependent
+        // decode chain.
+        uint32_t wb[16];
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+        {
+            wb[2 * j] = tile32[wp0[j]];
+            wb[2 * j + 1] = tile32[wp1[j]];
+        }
+        half w[8];
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+        {
+            const uint32_t w0 = __funnelshift_r(wb[2 * j + 1], wb[2 * j], ws0[j]) & 0xffffu;
+            w[j] = decode_3inst(w0, cb);
+        }
+
+        const half* x0k = x0 + kk * 16;
+        const half* x8k = x8 + kk * 16;
+        const half z = __float2half(0.0f);
+        FragA fa;
+        fa.elems[0] = __halves2half2(v0 ? x0k[kp] : z, v0 ? x0k[kp + 1] : z);
+        fa.elems[1] = __halves2half2(v8 ? x8k[kp] : z, v8 ? x8k[kp + 1] : z);
+        fa.elems[2] = __halves2half2(v0 ? x0k[kp + 8] : z, v0 ? x0k[kp + 9] : z);
+        fa.elems[3] = __halves2half2(v8 ? x8k[kp + 8] : z, v8 ? x8k[kp + 9] : z);
+
+        FragB fb0, fb1;
+        fb0.elems[0] = __halves2half2(w[0], w[1]);
+        fb0.elems[1] = __halves2half2(w[2], w[3]);
+        fb1.elems[0] = __halves2half2(w[4], w[5]);
+        fb1.elems[1] = __halves2half2(w[6], w[7]);
+
+        ptx_mma_m16n8k16(fa, fb0, frag_c[0]);
+        ptx_mma_m16n8k16(fa, fb1, frag_c[1]);
+    }
+
+    // Stage fp32 partials in (row, col) layout. Fragment element (m, n)
+    // mapping per the pinned PTX D layout (see v1's s_acc staging): per lane,
+    // frag f covers warp columns {warp*16 + 8f + c0, +1} for rows {m0, m8}.
+    const int c0 = (lane & 3) << 1;
+    float* ws_row0 = g_ws + (((long)col_block * splits + ks) * m + m0) * n;
+    float* ws_row8 = g_ws + (((long)col_block * splits + ks) * m + m8) * n;
+    if (v0)
+    {
+        ws_row0[n_base + warp * 16 + c0]         = frag_c[0].elems[0];
+        ws_row0[n_base + warp * 16 + c0 + 1]     = frag_c[0].elems[1];
+        ws_row0[n_base + warp * 16 + 8 + c0]     = frag_c[1].elems[0];
+        ws_row0[n_base + warp * 16 + 8 + c0 + 1] = frag_c[1].elems[1];
+    }
+    if (v8)
+    {
+        ws_row8[n_base + warp * 16 + c0]         = frag_c[0].elems[2];
+        ws_row8[n_base + warp * 16 + c0 + 1]     = frag_c[0].elems[3];
+        ws_row8[n_base + warp * 16 + 8 + c0]     = frag_c[1].elems[2];
+        ws_row8[n_base + warp * 16 + 8 + c0 + 1] = frag_c[1].elems[3];
+    }
+}
+
+// V2 reduce + fused epilogue: one block per 128-col output block; each warp
+// covers 2 rows; per lane, cols {lane, lane+32, lane+64, lane+96} are summed
+// over the k-splits in fixed order (deterministic), then the identical
+// Hadamard/svh/bias epilogue as v1.
+__global__ void exl3_reduce_epilogue_kernel(
+    const float* __restrict__ g_ws,   // (col_blocks, splits, m, n) fp32
+    const half* __restrict__ g_svh,
+    const half* __restrict__ g_bias,  // or nullptr
+    half* __restrict__ g_out,         // (m, n) fp16 or bf16
+    int m, int n, int splits, int bf16_out)
+{
+    const int t = threadIdx.x;
+    const int lane = t & 31;
+    const int warp = t >> 5;
+    const int col_block = blockIdx.x;
+    const int n_base = col_block * 128;
+    constexpr int rr = 2;  // rows per warp (m <= 16)
+#pragma unroll
+    for (int r = 0; r < rr; r++)
+    {
+        const int row = warp * rr + r;
+        if (row >= m) continue;
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+        {
+            const int col = n_base + lane + 32 * j;
+            float acc = 0.0f;
+            for (int ks = 0; ks < splits; ks++)
+                acc += g_ws[(((long)col_block * splits + ks) * m + row) * n + col];
+            v[j] = acc;
+        }
+        had_warp_butterfly(v, lane);
+        for (int j = 0; j < 4; j++)
+        {
+            const int col = n_base + lane + 32 * j;
+            float fv = v[j] * kRScale;
+            if (bf16_out)
+            {
+                float p = fv * __half2float(g_svh[col]);
+                if (g_bias) p += __half2float(g_bias[col]);
+                reinterpret_cast<__nv_bfloat16 *>(g_out)[(long)row * n + col] =
+                    __float2bfloat16_rn(p);
+                continue;
+            }
+            if (fv > 65504.f) fv = 65504.f; else if (fv < -65504.f) fv = -65504.f;
+            half h = __float2half_rn(fv);
+            float p = __half2float(h) * __half2float(g_svh[col]);
+            if (p > 65504.f) p = 65504.f; else if (p < -65504.f) p = -65504.f;
+            h = __float2half_rn(p);
+            if (g_bias)
+            {
+                float b = __half2float(h) + __half2float(g_bias[col]);
+                if (b > 65504.f) b = 65504.f; else if (b < -65504.f) b = -65504.f;
+                h = __float2half_rn(b);
+            }
+            g_out[(long)row * n + col] = h;
+        }
+    }
+}
+
+}  // namespace exl3
+
+// ---------------------------------------------------------------------------
+
 void sgl_exl3_had_in(at::Tensor x, at::Tensor suh, at::Tensor out)
 {
     TORCH_CHECK(x.is_cuda() && suh.is_cuda() && out.is_cuda(), "exl3 had_in: CUDA tensors required");
-    TORCH_CHECK(x.scalar_type() == at::kHalf && suh.scalar_type() == at::kHalf &&
-                out.scalar_type() == at::kHalf, "exl3 had_in: fp16 required");
+    TORCH_CHECK((x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16) &&
+                suh.scalar_type() == at::kHalf &&
+                out.scalar_type() == at::kHalf, "exl3 had_in: fp16/bf16 x, fp16 suh/out required");
     TORCH_CHECK(x.is_contiguous() && suh.is_contiguous() && out.is_contiguous(),
                 "exl3 had_in: contiguous required");
     const int m = x.size(0);
@@ -271,9 +477,10 @@ void sgl_exl3_had_in(at::Tensor x, at::Tensor suh, at::Tensor out)
     auto stream = at::cuda::getCurrentCUDAStream();
     dim3 grid(m, (k + 1023) / 1024);
     exl3::exl3_had_in_kernel<<<grid, 256, 0, stream>>>(
-        reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const half *>(x.data_ptr()),
         reinterpret_cast<const half *>(suh.data_ptr<at::Half>()),
-        reinterpret_cast<half *>(out.data_ptr<at::Half>()), k);
+        reinterpret_cast<half *>(out.data_ptr<at::Half>()), k,
+        x.scalar_type() == at::kBFloat16 ? 1 : 0);
 }
 
 void sgl_exl3_linear(
@@ -287,8 +494,9 @@ void sgl_exl3_linear(
     TORCH_CHECK(x.is_cuda() && packed.is_cuda() && svh.is_cuda() && out.is_cuda(),
                 "exl3 linear: CUDA tensors required");
     TORCH_CHECK(x.scalar_type() == at::kHalf && packed.scalar_type() == at::kShort &&
-                svh.scalar_type() == at::kHalf && out.scalar_type() == at::kHalf,
-                "exl3 linear: fp16 x/svh/out, int16 packed required");
+                svh.scalar_type() == at::kHalf &&
+                (out.scalar_type() == at::kHalf || out.scalar_type() == at::kBFloat16),
+                "exl3 linear: fp16 x/svh, int16 packed, fp16/bf16 out required");
     TORCH_CHECK(x.is_contiguous() && packed.is_contiguous() && svh.is_contiguous() &&
                 out.is_contiguous(), "exl3 linear: contiguous required");
     const int m = x.size(0);
@@ -310,17 +518,52 @@ void sgl_exl3_linear(
             : nullptr;
     const uint16_t* packed_ptr =
         reinterpret_cast<const uint16_t *>(packed.data_ptr<int16_t>());
-    dim3 grid(n16 / 8, (m + 15) / 16);
     const half* xp = reinterpret_cast<const half *>(x.data_ptr<at::Half>());
     const half* svp = reinterpret_cast<const half *>(svh.data_ptr<at::Half>());
-    half* op = reinterpret_cast<half *>(out.data_ptr<at::Half>());
+    half* op = reinterpret_cast<half *>(out.data_ptr());  // fp16 or bf16 out
     int icb = (int)cb;
     int mi = m, ki = k, ni = n, n16i = n16;
+    const int bf16_out = out.scalar_type() == at::kBFloat16 ? 1 : 0;
+
+    if (m <= 16)
+    {
+        // V2 decode path: split K so sibling blocks hide the serial decode
+        // latency (see kernel comment). Workspace partials are fully written
+        // by the gemm (every (col_block, split, row<m, col) cell exactly
+        // once), so no zero-init is needed.
+        const int col_blocks = n16 / 8;
+        int splits = (680 + col_blocks - 1) / col_blocks;
+        if (splits < 1) splits = 1;
+        const int max_splits = ki / 16 / 8;  // keep >= 8 k-tiles per block
+        if (splits > max_splits) splits = max_splits;
+        if (splits > 32) splits = 32;
+        if (splits < 1) splits = 1;
+        auto ws = at::empty(
+            {(long)col_blocks * splits * mi * ni}, x.options().dtype(at::kFloat));
+        float* wsp = ws.data_ptr<float>();
+        dim3 grid(col_blocks, splits);
+        switch (bits)
+        {
+            case 1: exl3::exl3_gemm_kernel_v2<1, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
+            case 2: exl3::exl3_gemm_kernel_v2<2, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
+            case 3: exl3::exl3_gemm_kernel_v2<3, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
+            case 4: exl3::exl3_gemm_kernel_v2<4, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
+            case 5: exl3::exl3_gemm_kernel_v2<5, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
+            case 6: exl3::exl3_gemm_kernel_v2<6, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
+            case 7: exl3::exl3_gemm_kernel_v2<7, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
+            case 8: exl3::exl3_gemm_kernel_v2<8, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
+            default: TORCH_CHECK(false, "exl3 linear: unsupported bitrate");
+        }
+        exl3::exl3_reduce_epilogue_kernel<<<col_blocks, 256, 0, stream>>>(
+            wsp, svp, bias_ptr, op, mi, ni, splits, bf16_out);
+        return;
+    }
 
 #define EXL3_DISPATCH(B)                                                                   \
     exl3::exl3_gemm_kernel<B, 16><<<grid, 256, 0, stream>>>(                               \
-        xp, packed_ptr, svp, bias_ptr, op, mi, ki, ni, n16i, icb);                         \
+        xp, packed_ptr, svp, bias_ptr, op, mi, ki, ni, n16i, icb, bf16_out);               \
     break;
+    dim3 grid(n16 / 8, (m + 15) / 16);
     switch (bits)
     {
         case 1: EXL3_DISPATCH(1);
