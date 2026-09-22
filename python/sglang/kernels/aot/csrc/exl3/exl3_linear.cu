@@ -289,8 +289,11 @@ template <int BITS, int BM>
 __global__ void exl3_gemm_kernel_v2(
     const half* __restrict__ g_x,
     const uint16_t* __restrict__ g_packed,
-    float* __restrict__ g_ws,          // (col_blocks, splits, m, n) fp32
-    int m, int k, int n, int n16, int cb, int splits)
+    float* __restrict__ g_ws,          // (col_blocks, splits, m, 128) fp32
+    int* __restrict__ g_cnt,           // (col_blocks) split-arrival counters
+    int m, int k, int n, int n16, int cb, int splits,
+    const half* __restrict__ g_svh, const half* __restrict__ g_bias,
+    half* __restrict__ g_out, int bf16_out)
 {
     constexpr int words16 = BITS * 16;
     const int t = threadIdx.x;
@@ -393,6 +396,66 @@ __global__ void exl3_gemm_kernel_v2(
         ws_row8[warp * 16 + 8 + c0]     = frag_c[1].elems[2];
         ws_row8[warp * 16 + 8 + c0 + 1] = frag_c[1].elems[3];
     }
+
+    // Fused epilogue: the LAST split to arrive for this column block reads
+    // all splits' partials in fixed order (deterministic) and applies the
+    // Hadamard/svh/bias epilogue inline — removes the separate reduce
+    // launch (400/step at decode). The counter resets to 0 so CUDA-graph
+    // replays see the initial state.
+    __shared__ bool s_is_last;
+    if (threadIdx.x == 0)
+    {
+        __threadfence();
+        const int done = atomicAdd(g_cnt + col_block, 1);
+        s_is_last = (done == splits - 1);
+    }
+    __syncthreads();
+    if (!s_is_last) return;  // whole block exits together
+
+    // Block-wide reduce + epilogue over the 16 rows this block covers (m<=16):
+    // 8 warps x 2 rows, matching the reduce kernel's assignment.
+    for (int rr2 = 0; rr2 < 2; rr2++)
+    {
+        const int r = warp * 2 + rr2;
+        if (r >= m) continue;
+        float v[4];
+        for (int j = 0; j < 4; j++)
+        {
+            const int cl = lane + 32 * j;
+            float acc = 0.0f;
+            for (int s2 = 0; s2 < splits; s2++)
+                acc += g_ws[(((long)col_block * splits + s2) * m + r) * 128 + cl];
+            v[j] = acc;
+        }
+        had_warp_butterfly(v, lane);
+        for (int j = 0; j < 4; j++)
+        {
+            const int col = n_base + lane + 32 * j;
+            float fv = v[j] * kRScale;
+            if (bf16_out)
+            {
+                float pp = fv * __half2float(g_svh[col]);
+                if (g_bias) pp += __half2float(g_bias[col]);
+                reinterpret_cast<__nv_bfloat16 *>(g_out)[(long)r * n + col] =
+                    __float2bfloat16_rn(pp);
+                continue;
+            }
+            if (fv > 65504.f) fv = 65504.f; else if (fv < -65504.f) fv = -65504.f;
+            half h = __float2half_rn(fv);
+            float pp = __half2float(h) * __half2float(g_svh[col]);
+            if (pp > 65504.f) pp = 65504.f; else if (pp < -65504.f) pp = -65504.f;
+            h = __float2half_rn(pp);
+            if (g_bias)
+            {
+                float b2 = __half2float(h) + __half2float(g_bias[col]);
+                if (b2 > 65504.f) b2 = 65504.f; else if (b2 < -65504.f) b2 = -65504.f;
+                h = __float2half_rn(b2);
+            }
+            g_out[(long)r * n + col] = h;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) g_cnt[col_block] = 0;  // reset for graph replay
 }
 
 // V2 reduce + fused epilogue: one block per 128-col output block; each warp
@@ -665,21 +728,23 @@ void sgl_exl3_linear(
         auto ws = at::empty(
             {(long)col_blocks * splits * mi * 128}, x.options().dtype(at::kFloat));
         float* wsp = ws.data_ptr<float>();
+        // Split-arrival counters: zeroed at capture; the last block per
+        // column block resets its counter so graph replays see zeros.
+        auto cnt = at::zeros({col_blocks}, x.options().dtype(at::kInt));
+        int* cp = cnt.data_ptr<int>();
         dim3 grid(col_blocks, splits);
         switch (bits)
         {
-            case 1: exl3::exl3_gemm_kernel_v2<1, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 2: exl3::exl3_gemm_kernel_v2<2, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 3: exl3::exl3_gemm_kernel_v2<3, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 4: exl3::exl3_gemm_kernel_v2<4, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 5: exl3::exl3_gemm_kernel_v2<5, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 6: exl3::exl3_gemm_kernel_v2<6, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 7: exl3::exl3_gemm_kernel_v2<7, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 8: exl3::exl3_gemm_kernel_v2<8, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
+            case 1: exl3::exl3_gemm_kernel_v2<1, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
+            case 2: exl3::exl3_gemm_kernel_v2<2, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
+            case 3: exl3::exl3_gemm_kernel_v2<3, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
+            case 4: exl3::exl3_gemm_kernel_v2<4, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
+            case 5: exl3::exl3_gemm_kernel_v2<5, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
+            case 6: exl3::exl3_gemm_kernel_v2<6, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
+            case 7: exl3::exl3_gemm_kernel_v2<7, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
+            case 8: exl3::exl3_gemm_kernel_v2<8, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
             default: TORCH_CHECK(false, "exl3 linear: unsupported bitrate");
         }
-        exl3::exl3_reduce_epilogue_kernel<<<col_blocks, 256, 0, stream>>>(
-            wsp, svp, bias_ptr, op, mi, ni, splits, bf16_out);
         return;
     }
 
