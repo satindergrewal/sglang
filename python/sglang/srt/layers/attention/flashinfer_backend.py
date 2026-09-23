@@ -1052,12 +1052,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.prefill_uses_dequant_workspace
                 and self.token_to_kv_pool.__class__.__name__ == "SWAKVPool"
             ):
-                first_layer_id = (
-                    self.layers[0].layer_id if hasattr(self, "layers") else 0
-                )
                 self.dq_swa_page_table, self.dq_swa_paged_kernel_lens = (
                     self.token_to_kv_pool.prepare_swa_dequant_workspace(
-                        first_layer_id,
                         self.req_to_token_pool.req_to_token,
                         forward_batch.req_pool_indices.cpu().tolist(),
                         seq_lens_cpu,
