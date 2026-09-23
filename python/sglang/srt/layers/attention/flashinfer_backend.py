@@ -952,6 +952,17 @@ class FlashInferAttnBackend(AttentionBackend):
             int(seq_len.item()) if isinstance(seq_len, torch.Tensor) else int(seq_len)
             for seq_len in raw_paged_seq_lens
         ]
+        # The workspace holds one row per live token; capture-time dummies can
+        # fabricate batches (bs x max_seq) larger than the token pool, which
+        # would plan attention past the workspace. Fail loudly instead.
+        total_rows = sum(paged_seq_lens) + self.page_size + 256
+        get_rows = getattr(self.token_to_kv_pool, "get_dequant_workspace_rows", None)
+        if get_rows is not None and total_rows > get_rows():
+            raise RuntimeError(
+                f"FP4 dequant workspace overflow: batch needs {total_rows} rows "
+                f"but the workspace holds {get_rows()}; reduce cuda-graph max "
+                "batch size or max_running_requests."
+            )
         if sum(paged_seq_lens) <= 0:
             self.cpu_req_pool_indices = forward_batch.req_pool_indices.to(
                 "cpu", non_blocking=True

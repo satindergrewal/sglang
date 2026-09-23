@@ -888,10 +888,16 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         def pack_matrix(e, prefix, shard):
             trellis = get(e, prefix, shard, "trellis")
             if trellis is None:
-                raise RuntimeError(
-                    "exl3 MoE packed mode requires every local expert to be "
-                    f"trellis-quantized (expert {e} {prefix}/{shard} is not)"
-                )
+                # Mixed checkpoint: this expert (e.g. the fused shared expert)
+                # arrived as plain native weights; keep them materialized.
+                plain = get(e, prefix, shard, "weight")
+                if plain is None:
+                    raise RuntimeError(
+                        "exl3 MoE packed: expert "
+                        f"{e} {prefix}/{shard} has neither trellis nor plain "
+                        "tensors"
+                    )
+                return ("plain", plain.to(dev).to(self.params_dtype or torch.float16))
             suh = get(e, prefix, shard, "suh")
             svh = get(e, prefix, shard, "svh")
             mul1 = get(e, prefix, shard, "mul1")
@@ -903,6 +909,7 @@ class ExL3MoEMethod(FusedMoEMethodBase):
                 )
             bias = get(e, prefix, shard, "bias")
             return (
+                "trellis",
                 trellis.to(dev),
                 suh.to(dev),
                 svh.to(dev),
@@ -925,8 +932,10 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         torch.cuda.empty_cache()
 
     def _exl3_gemm(self, x2, matrix, out_dt):
-        """One packed trellis GEMM, same numerics contract as the dense path."""
-        trellis, suh, svh, bias, cb = matrix
+        """One packed GEMM, same numerics contract as the dense path."""
+        if matrix[0] == "plain":
+            return F.linear(x2, matrix[1]).to(out_dt)
+        _, trellis, suh, svh, bias, cb = matrix
         xh = torch.empty(x2.shape, dtype=torch.float16, device=x2.device)
         torch.ops.sgl_kernel.sgl_exl3_had_in(x2, suh, xh)
         out = torch.empty((x2.shape[0], svh.shape[0]), dtype=out_dt, device=x2.device)
@@ -970,8 +979,10 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         for c in counts_l:
             starts_l.append(starts_l[-1] + c)
 
+        down0 = packed["down"][0]
+        out_dim = down0[3].shape[0] if down0[0] == "trellis" else down0[1].shape[0]
         out = torch.zeros(
-            (x.shape[0], packed["down"][0][2].shape[0]),
+            (x.shape[0], out_dim),
             dtype=torch.float32,
             device=x.device,
         )
