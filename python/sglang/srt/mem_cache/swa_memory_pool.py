@@ -241,7 +241,8 @@ class SWAKVPool(BaseSWAKVPool):
         self._wait_for_layer(layer.layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer.layer_id]
         inner = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
-        if is_swa_layer and kwargs.get("use_b_side"):
+        use_b_side = kwargs.pop("use_b_side", False)
+        if is_swa_layer and use_b_side:
             return inner.get_flashinfer_dequant_workspace_kv_buffer_b(
                 layer, *args, layer_id_override=layer_id_pool, **kwargs
             )
