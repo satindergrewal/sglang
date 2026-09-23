@@ -352,15 +352,6 @@ class FlashInferAttnBackend(AttentionBackend):
             and model_runner.model_config.v_head_dim
             != model_runner.model_config.head_dim
         )
-        logger.info(
-            "FlashInfer init: dq_ws=%s decode_as_extend=%s v_head=%s head=%s "
-            "decode_access=%s",
-            self.decode_uses_dequant_workspace,
-            self.decode_as_extend,
-            model_runner.model_config.v_head_dim,
-            model_runner.model_config.head_dim,
-            getattr(self.decode_kv_access, "kind", None),
-        )
         self.is_nvfp4_kvcache = any(
             access is not None and access.scale_recipe == "nvfp4"
             for access in (self.prefill_kv_access, self.decode_kv_access)
@@ -368,17 +359,6 @@ class FlashInferAttnBackend(AttentionBackend):
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
         self.cpu_req_pool_indices = None
-        # Decode-as-extend for asymmetric K/V head dims over the FP8 dequant
-        # workspace: FlashInfer's decode kernels hardcode head_dim_vo =
-        # head_dim_qk, so a 192K/128V model (MiMo-V2.6) decodes through the
-        # paged-prefill kernel with q_len=1 (correct; slightly slower than
-        # the dedicated decode kernel).
-        self.decode_as_extend = (
-            self.decode_uses_dequant_workspace
-            and model_runner.model_config.v_head_dim is not None
-            and model_runner.model_config.v_head_dim
-            != model_runner.model_config.head_dim
-        )
         # FP4 fake-quant prefill/decode exposes an FP8 workspace to FlashInfer.
         self.flashinfer_kv_cache_dtype = (
             torch.float8_e4m3fn
@@ -776,6 +756,12 @@ class FlashInferAttnBackend(AttentionBackend):
         if in_capture:
             num_tokens = forward_batch.positions.numel()
             self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
+
+        if forward_mode.is_decode_or_idle() and self.decode_as_extend:
+            # Decode-as-extend builds eager prefill metadata (the dequant
+            # workspace prepare is not graph-capturable).
+            self.init_forward_metadata(forward_batch)
+            return
 
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
