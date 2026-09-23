@@ -2875,18 +2875,63 @@ class MHATokenToKVPool(KVCache):
         v_cur: Optional[torch.Tensor] = None,
         layer_id_override: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the b-side FP8 workspace view (already populated by the
-        SWA dequant prepare). No re-preparation happens here."""
+        """Return the b-side FP8 workspace view after filling it for this layer.
+
+        The row layout and gather plan are layer-independent (stashed by the
+        SWA pool's prepare_swa_dequant_workspace at metadata time); the FP4
+        data is per-layer, so the dequant runs here per attention call, the
+        same per-layer contract the a-side workspace follows."""
         if self.dq_k_buffer_b is None or self.dq_v_buffer_b is None:
             raise RuntimeError(
                 "B-side dequant workspace requested from a KV pool without FP4 "
                 "dequant buffers."
             )
+        self._fill_swa_dequant_workspace(layer, layer_id_override)
         v_head_dim = getattr(layer, "v_head_dim", None) or layer.head_dim
         return (
             self.dq_k_buffer_b.view(-1, layer.tp_k_head_num, layer.head_dim),
             self.dq_v_buffer_b.view(-1, layer.tp_v_head_num, v_head_dim),
         )
+
+    def _fill_swa_dequant_workspace(
+        self,
+        layer: RadixAttention,
+        layer_id_override: Optional[int],
+    ) -> None:
+        """Fill the b-side workspace for one layer from the stashed gather plan."""
+        plan = getattr(self, "_swa_dq_gather", None)
+        if plan is None:
+            raise RuntimeError(
+                "b-side SWA dequant fill without a gather plan; prepare_swa_"
+                "dequant_workspace must run in metadata before attention."
+            )
+        locs, valid, row_end = plan
+        dq_k, dq_v = self.get_dequant_workspace_b()
+        row = self.page_size
+        dq_k[row:row_end].zero_()
+        dq_v[row:row_end].zero_()
+        if locs.numel() == 0:
+            return
+        layer_id_pool = (
+            layer_id_override
+            if layer_id_override is not None
+            else layer.layer_id
+        )
+        k_fp4, v_fp4, k_scales, v_scales = self.get_raw_kv_buffer(layer_id_pool)
+        safe = locs.clamp(min=0)
+        k_fp8, v_fp8 = self.quant_method.dequantize_prev_kv(
+            k_fp4[safe], k_scales[safe], v_fp4[safe], v_scales[safe], layer.layer_id
+        )
+        dq_k[row:row_end] = k_fp8
+        dq_v[row:row_end] = v_fp8
+        if not bool(valid.all().item()):
+            # Evicted SWA slots (-1) contribute nothing: zero their rows.
+            dq_k[row:row_end] = torch.where(
+                valid.unsqueeze(-1), dq_k[row:row_end], torch.zeros_like(dq_k[row:row_end])
+            )
+            dq_v[row:row_end] = torch.where(
+                valid.unsqueeze(-1), dq_v[row:row_end], torch.zeros_like(dq_v[row:row_end])
+            )
 
     def get_flashinfer_decode_dequant_workspace_kv_buffer(
         self,

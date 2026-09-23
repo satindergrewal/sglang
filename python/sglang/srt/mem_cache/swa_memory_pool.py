@@ -264,34 +264,28 @@ class SWAKVPool(BaseSWAKVPool):
 
     def prepare_swa_dequant_workspace(
         self,
-        layer_id: int,
         req_to_token: torch.Tensor,
         req_pool_indices_cpu,
         seq_lens_cpu,
         sliding_window_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Fill the b-side FP8 workspace from the SWA pool for one decode step.
+        """Build the b-side decode-as-extend gather plan and page table.
 
         Decode-as-extend plans the paged wrapper over the cached prefix only
-        (the current token is covered by the ragged side), so this gathers the
-        last min(seq_len - 1, window) prefix tokens per request, translates
-        full-pool slots to SWA slots, dequantizes FP4 -> FP8 into the b-side
-        workspace, and returns (page_table, kv_lens) for the SWA paged plan.
-        """
-        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
-        if not is_swa_layer:
-            raise RuntimeError(
-                "SWA dequant workspace prepare called for a full-attention layer."
-            )
-        dq_k, dq_v = self.swa_kv_pool.get_dequant_workspace_b()
-        k_fp4, v_fp4, k_scales, v_scales = self.swa_kv_pool.get_raw_kv_buffer(
-            layer_id_pool
-        )
+        (the current token is covered by the ragged side). The row layout and
+        the full->SWA slot gather are layer-independent, so they are computed
+        once per decode step here and stashed on the SWA inner pool; the
+        per-layer FP4 -> FP8 fill happens in the b-side workspace getter, the
+        same per-layer contract the a-side workspace follows.
 
+        Returns (page_table, kv_lens) for the SWA paged plan.
+        """
         row = self.page_size  # reserved scratch row, matches the a-side layout
         table_entries = []
         kv_lens = []
-        device = dq_k.device
+        locs_parts = []
+        valid_parts = []
+        device = req_to_token.device
         for i in range(len(req_pool_indices_cpu)):
             req_idx = int(req_pool_indices_cpu[i])
             seq_len = int(seq_lens_cpu[i])
@@ -300,32 +294,8 @@ class SWAKVPool(BaseSWAKVPool):
                 start = seq_len - 1 - keep
                 locs = req_to_token[req_idx, start : seq_len - 1]
                 locs = self.translate_loc_from_full_to_swa(locs)
-                valid = locs >= 0
-                safe = locs.clamp(min=0)
-                # Same dequant path as the a-side prefix prepare: the quant
-                # method indexes its global scales by the absolute layer id.
-                k_fp8, v_fp8 = self.swa_kv_pool.quant_method.dequantize_prev_kv(
-                    k_fp4[safe],
-                    k_scales[safe],
-                    v_fp4[safe],
-                    v_scales[safe],
-                    layer_id,
-                )
-                dq_k[row : row + keep] = k_fp8
-                dq_v[row : row + keep] = v_fp8
-                # Invalidate rows whose SWA slot was evicted (-1): zero KV +
-                # zero scale -> zero contribution after dequant.
-                if not bool(valid.all().item()):
-                    dq_k[row : row + keep] = torch.where(
-                        valid.unsqueeze(-1),
-                        dq_k[row : row + keep],
-                        torch.zeros_like(dq_k[row : row + keep]),
-                    )
-                    dq_v[row : row + keep] = torch.where(
-                        valid.unsqueeze(-1),
-                        dq_v[row : row + keep],
-                        torch.zeros_like(dq_v[row : row + keep]),
-                    )
+                locs_parts.append(locs)
+                valid_parts.append(locs >= 0)
                 table_entries.append(
                     torch.arange(row, row + keep, dtype=torch.int32, device=device)
                 )
@@ -335,6 +305,15 @@ class SWAKVPool(BaseSWAKVPool):
                 )
             kv_lens.append(keep)
             row += keep
+
+        if locs_parts:
+            locs = torch.cat(locs_parts)
+            valid = torch.cat(valid_parts)
+        else:
+            locs = torch.zeros(0, dtype=torch.long, device=device)
+            valid = torch.zeros(0, dtype=torch.bool, device=device)
+        # Gather plan consumed per layer by fill_swa_dequant_workspace.
+        self.swa_kv_pool._swa_dq_gather = (locs, valid, row)
 
         page_table = (
             torch.cat(table_entries)
