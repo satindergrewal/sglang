@@ -1025,28 +1025,40 @@ class FlashInferAttnBackend(AttentionBackend):
             forward_batch.extend_prefix_lens_cpu = [
                 int(x) - 1 for x in seq_lens_cpu
             ]
+            # a-side: full-pool prefix dequant (existing helper).
             self._prepare_dequant_workspace_metadata_for_extend(
                 forward_batch, False
             )
+            # b-side: SWA-pool prefix dequant (translated + window-trimmed)
+            # for the hybrid SWA pool; single-pool setups skip it.
+            if self.token_to_kv_pool.__class__.__name__ == "SWAKVPool":
+                first_layer_id = (
+                    self.layers[0].layer_id if hasattr(self, "layers") else 0
+                )
+                self.dq_swa_page_table, self.dq_swa_paged_kernel_lens = (
+                    self.token_to_kv_pool.prepare_swa_dequant_workspace(
+                        first_layer_id,
+                        self.req_to_token_pool.req_to_token,
+                        forward_batch.req_pool_indices.cpu().tolist(),
+                        seq_lens_cpu,
+                        self.sliding_window_size,
+                    )
+                )
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_cpu,
                 forward_batch.seq_lens_sum,
-                # prefix = seq - 1: qo_indptr gets one query per request,
-                # while kv_indptr comes from dq_paged_kernel_lens (the full
-                # sequence — the dequant workspace holds prefix + current).
                 forward_batch.extend_prefix_lens,
                 prefill_wrappers=self.prefill_wrappers_paged,
-                use_ragged=False,
+                use_ragged=True,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=None,
                 extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
-                custom_kv_indices=self.dq_page_table,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
-                False,
+                True,
                 False,
                 swa_out_cache_loc=swa_out_cache_loc,
             )
@@ -1410,6 +1422,13 @@ class FlashInferAttnBackend(AttentionBackend):
         # We perform dequant for chunk prefill/cache reuse.
         pool = self.token_to_kv_pool
         if self.prefill_uses_dequant_workspace:
+            # Decode-as-extend: SWA layers read the b-side workspace (filled
+            # from the SWA pool during metadata prep; no re-preparation).
+            layer_is_swa = (
+                getattr(self, "decode_as_extend", False)
+                and layer.sliding_window_size is not None
+                and layer.sliding_window_size != -1
+            )
             kv_cache = pool.get_flashinfer_dequant_workspace_kv_buffer(
                 layer,
                 self.req_to_token_pool.req_to_token,
@@ -1417,10 +1436,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.extend_prefix_lens_cpu,
                 forward_batch.extend_seq_lens_cpu,
                 self.page_size,
-                prepare_workspace=self.dq_page_table is not None,
+                prepare_workspace=(
+                    self.dq_page_table is not None and not layer_is_swa
+                ),
                 use_ragged=self.forward_metadata.use_ragged,
                 k_cur=k,
                 v_cur=v,
+                use_b_side=layer_is_swa,
             )
         else:
             kv_cache = pool.get_kv_buffer(layer.layer_id)
@@ -2109,10 +2131,15 @@ class FlashInferIndicesUpdaterPrefill:
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
     ):
-        if custom_kv_indices is not None:
+        if custom_kv_indices is not None and not self.attn_backend.decode_as_extend:
             raise RuntimeError(
                 "NVFP4 custom KV indices are only supported by the single-wrapper FlashInfer path."
             )
+        custom_kv_indices_swa = (
+            self.attn_backend.dq_swa_page_table
+            if custom_kv_indices is not None and self.attn_backend.decode_as_extend
+            else None
+        )
         if prefix_lens is None:
             num_accept_tokens = getattr(spec_info, "num_accept_tokens", None)
             # Spec verify keeps its query block outside seq_lens, so an unset
@@ -2171,6 +2198,16 @@ class FlashInferIndicesUpdaterPrefill:
                 wrapper_id == 0 and self._swa_kv_pool is not None
             )
 
+            if wrapper_id == 0 and custom_kv_indices_swa is not None:
+                # SWA wrapper reads the b-side dequant workspace (SWA pool,
+                # translated + window-trimmed rows).
+                self.attn_backend.dq_page_table = custom_kv_indices_swa
+                self.attn_backend.dq_paged_kernel_lens = (
+                    self.attn_backend.dq_swa_paged_kernel_lens
+                )
+                wrapper_custom = custom_kv_indices_swa
+            else:
+                wrapper_custom = custom_kv_indices
             self.call_begin_forward(
                 self.prefill_wrapper_ragged,
                 prefill_wrappers[wrapper_id],
@@ -2188,6 +2225,7 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
+                custom_kv_indices=wrapper_custom,
                 # paged-only SWA path only; ragged keeps its custom prefix
                 # mask, spec-verify keeps its tree mask
                 window_left=(

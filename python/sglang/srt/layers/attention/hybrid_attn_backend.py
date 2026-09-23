@@ -71,11 +71,17 @@ class HybridAttnBackend(AttentionBackend):
             The selected attention backend (prefill or decode)
 
         Note:
-            - decode_or_idle: Always uses decode backend
+            - decode_or_idle: uses the prefill backend when it declares
+              decode_as_extend (asymmetric-K/V NVFP4: its kernels honor
+              head_dim_vo != head_dim_qk and its SWA dual-wrapper dispatch
+              reads the per-pool dequant workspaces); otherwise always the
+              decode backend
             - target_verify: Uses decode backend if speculative_attention_mode is "decode", otherwise prefill backend
             - prefill: Always uses prefill backend
         """
         if forward_mode.is_decode_or_idle():
+            if getattr(self.prefill_backend, "decode_as_extend", False):
+                return self.prefill_backend
             return self.decode_backend
         elif forward_mode.is_target_verify():
             return (

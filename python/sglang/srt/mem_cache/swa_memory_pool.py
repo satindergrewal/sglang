@@ -62,6 +62,7 @@ class SWAKVPool(BaseSWAKVPool):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
+        self.quant_method = kwargs.get("quant_method")
         full_kv_pool_class = full_kv_pool_class or token_to_kv_pool_class
         swa_kv_pool_class = swa_kv_pool_class or token_to_kv_pool_class
         common_kwargs = {
@@ -235,10 +236,15 @@ class SWAKVPool(BaseSWAKVPool):
 
     def get_flashinfer_dequant_workspace_kv_buffer(self, layer, *args, **kwargs):
         # NVFP4/fp4 prefill dequant: route to the layer's owning pool with the
-        # pool-local layer id (mirrors get_kv_buffer's delegation).
+        # pool-local layer id (mirrors get_kv_buffer's delegation). kwargs
+        # "use_b_side" selects the SWA workspace copy for SWA layers.
         self._wait_for_layer(layer.layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer.layer_id]
         inner = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
+        if is_swa_layer and kwargs.get("use_b_side"):
+            return inner.get_flashinfer_dequant_workspace_kv_buffer_b(
+                layer, *args, layer_id_override=layer_id_pool, **kwargs
+            )
         return inner.get_flashinfer_dequant_workspace_kv_buffer(
             layer, *args, layer_id_override=layer_id_pool, **kwargs
         )
