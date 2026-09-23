@@ -382,6 +382,9 @@ class FlashInferAttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
+        # Decode-as-extend b-side prep needs the SWA window size; the indices
+        # updaters keep their own copy, the backend never did.
+        self.sliding_window_size = model_runner.sliding_window_size
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
