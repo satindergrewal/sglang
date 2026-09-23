@@ -54,9 +54,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-    NVFP4KVQuantizeUtil,
     UnquantizedKVCacheMethod,
 )
+from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
