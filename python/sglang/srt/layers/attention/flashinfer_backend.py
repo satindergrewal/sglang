@@ -761,8 +761,15 @@ class FlashInferAttnBackend(AttentionBackend):
             self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
 
         if forward_mode.is_decode_or_idle() and self.decode_as_extend:
-            # Decode-as-extend builds eager prefill metadata (the dequant
-            # workspace prepare is not graph-capturable).
+            # Decode-as-extend builds eager prefill metadata. The dequant
+            # workspace prepare is host-dependent (CPU gather plans, fresh
+            # table tensors), so a metadata glue-graph capture would freeze
+            # capture-time values and replay stale plan data. Fail the capture
+            # on purpose: the glue falls back to eager prep permanently.
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "decode-as-extend metadata prep is not graph-capturable"
+                )
             self.init_forward_metadata(forward_batch)
             return
 
