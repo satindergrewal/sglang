@@ -226,6 +226,23 @@ class SWAKVPool(BaseSWAKVPool):
         else:
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
+    def get_raw_kv_buffer(self, layer_id: int):
+        # NVFP4 decode (trtllm_mha XQA) reads the raw packed FP4 K/V + scales.
+        self._wait_for_layer(layer_id)
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        inner = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
+        return inner.get_raw_kv_buffer(layer_id_pool)
+
+    def get_flashinfer_dequant_workspace_kv_buffer(self, layer, *args, **kwargs):
+        # NVFP4/fp4 prefill dequant: route to the layer's owning pool with the
+        # pool-local layer id (mirrors get_kv_buffer's delegation).
+        self._wait_for_layer(layer.layer_id)
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer.layer_id]
+        inner = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
+        return inner.get_flashinfer_dequant_workspace_kv_buffer(
+            layer, *args, layer_id_override=layer_id_pool, **kwargs
+        )
+
     def get_kv_scale_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]

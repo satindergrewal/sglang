@@ -346,6 +346,12 @@ class FlashInferAttnBackend(AttentionBackend):
             and self.decode_kv_access.kind
             == KVCacheAttentionAccessKind.DEQUANT_WORKSPACE
         )
+        self.decode_as_extend = (
+            self.decode_uses_dequant_workspace
+            and model_runner.model_config.v_head_dim is not None
+            and model_runner.model_config.v_head_dim
+            != model_runner.model_config.head_dim
+        )
         self.is_nvfp4_kvcache = any(
             access is not None and access.scale_recipe == "nvfp4"
             for access in (self.prefill_kv_access, self.decode_kv_access)
@@ -353,6 +359,17 @@ class FlashInferAttnBackend(AttentionBackend):
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
         self.cpu_req_pool_indices = None
+        # Decode-as-extend for asymmetric K/V head dims over the FP8 dequant
+        # workspace: FlashInfer's decode kernels hardcode head_dim_vo =
+        # head_dim_qk, so a 192K/128V model (MiMo-V2.6) decodes through the
+        # paged-prefill kernel with q_len=1 (correct; slightly slower than
+        # the dedicated decode kernel).
+        self.decode_as_extend = (
+            self.decode_uses_dequant_workspace
+            and model_runner.model_config.v_head_dim is not None
+            and model_runner.model_config.v_head_dim
+            != model_runner.model_config.head_dim
+        )
         # FP4 fake-quant prefill/decode exposes an FP8 workspace to FlashInfer.
         self.flashinfer_kv_cache_dtype = (
             torch.float8_e4m3fn
@@ -493,9 +510,22 @@ class FlashInferAttnBackend(AttentionBackend):
                 and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             ):
                 fmha_backend = "cutlass"
+        elif get_platform().is_sm120:
+            # SM12x lacks tcgen05 (CUTLASS FMHA is SM100a/SM110a only), and
+            # the default trtllm-gen prefill dispatch rejects asymmetric
+            # K/V head dims (MiMo-V2.6's 192x128, Qwen3.5's geometry) with
+            # "Invalid configuration: NUM_MMA_*". FA2 templates support
+            # separate v_head_dim natively.
+            if (
+                model_runner.model_config.v_head_dim is not None
+                and model_runner.model_config.v_head_dim
+                != model_runner.model_config.head_dim
+            ):
+                fmha_backend = "fa2"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
         )
+        self.prefill_backend = fmha_backend
 
         # Two wrappers: one for sliding window attention and one for full attention.
         # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
@@ -885,6 +915,12 @@ class FlashInferAttnBackend(AttentionBackend):
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
         self.cpu_req_pool_indices = None
+        # Decode-as-extend for asymmetric K/V head dims over the FP8 dequant
+        # workspace: FlashInfer's decode kernels hardcode head_dim_vo =
+        # head_dim_qk, so a 192K/128V model (MiMo-V2.6) decodes through the
+        # paged-prefill kernel with q_len=1 (correct; slightly slower than
+        # the dedicated decode kernel).
+        self.decode_as_extend = getattr(self, "decode_as_extend", False)
         if not (
             self.prefill_uses_dequant_workspace
             and forward_batch.forward_mode.is_extend_without_speculative()
@@ -959,7 +995,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.out_cache_loc
             )
 
-        if forward_batch.forward_mode.is_decode_or_idle():
+        if forward_batch.forward_mode.is_decode_or_idle() and not self.decode_as_extend:
             self.indices_updater_decode.update(
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_cpu,
@@ -973,6 +1009,48 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.forward_metadata = DecodeMetadata(
                 self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
+            )
+        elif forward_batch.forward_mode.is_decode_or_idle() and self.decode_as_extend:
+            # Decode-as-extend: the single new token attends over the whole
+            # context through the paged-prefill kernel (q_len=1), which
+            # honors head_dim_vo != head_dim_qk and the attention sinks.
+            # Mirror the extend metadata: the just-written token is the extend
+            # part (prefix = seq - 1); the paged plan then covers the full
+            # sequence including it.
+            seq_lens_cpu = (
+                forward_batch.seq_lens_cpu
+                if forward_batch.seq_lens_cpu is not None
+                else forward_batch.seq_lens.cpu().tolist()
+            )
+            forward_batch.extend_seq_lens = torch.ones_like(
+                forward_batch.seq_lens
+            )
+            forward_batch.extend_seq_lens_cpu = [1] * len(seq_lens_cpu)
+            forward_batch.extend_prefix_lens = forward_batch.seq_lens - 1
+            forward_batch.extend_prefix_lens_cpu = [
+                int(x) - 1 for x in seq_lens_cpu
+            ]
+            self._prepare_dequant_workspace_metadata_for_extend(
+                forward_batch, False
+            )
+            self.indices_updater_prefill.update(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_cpu,
+                forward_batch.seq_lens_sum,
+                forward_batch.extend_prefix_lens,
+                prefill_wrappers=self.prefill_wrappers_paged,
+                use_ragged=False,
+                encoder_lens=forward_batch.encoder_lens,
+                spec_info=None,
+                extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
+                custom_kv_indices=self.dq_page_table,
+            )
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_wrappers_paged,
+                False,
+                False,
+                swa_out_cache_loc=swa_out_cache_loc,
             )
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -1312,6 +1390,7 @@ class FlashInferAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sinks=None,
     ):
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
@@ -1364,30 +1443,57 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
-            o = prefill_wrapper_paged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                kv_cache,
-                causal=causal,
-                sm_scale=layer.scaling,
-                # Disable sliding window attention for multi-item scoring:
-                # - Sliding window could cut across item boundaries, breaking semantic coherence
-                # - Multi-item sequences need full attention to properly handle delimiter tokens
-                # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
-                #   provide more precise attention control than simple sliding windows
-                # - Item-aware masking takes precedence over window-based masking
-                window_left=(
-                    layer.sliding_window_size
-                    if not (
-                        self.forward_metadata.multi_item_params
-                        and self.forward_metadata.multi_item_params.is_enabled()
-                    )
-                    else -1
-                ),
-                logits_soft_cap=logits_soft_cap,
-                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
-            )
+            if sinks is not None:
+                o, lse = prefill_wrapper_paged.forward_return_lse(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    kv_cache,
+                    causal=causal,
+                    sm_scale=layer.scaling,
+                    # Disable sliding window attention for multi-item scoring:
+                    # - Sliding window could cut across item boundaries, breaking semantic coherence
+                    # - Multi-item sequences need full attention to properly handle delimiter tokens
+                    # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
+                    #   provide more precise attention control than simple sliding windows
+                    # - Item-aware masking takes precedence over window-based masking
+                    window_left=(
+                        layer.sliding_window_size
+                        if not (
+                            self.forward_metadata.multi_item_params
+                            and self.forward_metadata.multi_item_params.is_enabled()
+                        )
+                        else -1
+                    ),
+                    logits_soft_cap=logits_soft_cap,
+                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
+                o = self._apply_attention_sinks(o, lse, sinks, forward_batch)
+            else:
+                o = prefill_wrapper_paged.forward(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    kv_cache,
+                    causal=causal,
+                    sm_scale=layer.scaling,
+                    # Disable sliding window attention for multi-item scoring:
+                    # - Sliding window could cut across item boundaries, breaking semantic coherence
+                    # - Multi-item sequences need full attention to properly handle delimiter tokens
+                    # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
+                    #   provide more precise attention control than simple sliding windows
+                    # - Item-aware masking takes precedence over window-based masking
+                    window_left=(
+                        layer.sliding_window_size
+                        if not (
+                            self.forward_metadata.multi_item_params
+                            and self.forward_metadata.multi_item_params.is_enabled()
+                        )
+                        else -1
+                    ),
+                    logits_soft_cap=logits_soft_cap,
+                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
             # `self.token_to_kv_pool` for this layer. This enables attention over
@@ -1412,14 +1518,27 @@ class FlashInferAttnBackend(AttentionBackend):
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
-                o = self.prefill_wrapper_ragged.forward(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                    causal=causal,
-                    sm_scale=layer.scaling,
-                    logits_soft_cap=logits_soft_cap,
-                )
+                v_head_dim_r = getattr(layer, "v_head_dim", None) or layer.head_dim
+                v_r = v.view(-1, layer.tp_v_head_num, v_head_dim_r)
+                if sinks is not None:
+                    o, lse = self.prefill_wrapper_ragged.forward_return_lse(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                        v_r,
+                        causal=causal,
+                        sm_scale=layer.scaling,
+                        logits_soft_cap=logits_soft_cap,
+                    )
+                    o = self._apply_attention_sinks(o, lse, sinks, forward_batch)
+                else:
+                    o = self.prefill_wrapper_ragged.forward(
+                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                        v_r,
+                        causal=causal,
+                        sm_scale=layer.scaling,
+                        logits_soft_cap=logits_soft_cap,
+                    )
 
             else:
                 swa_window_left = (
@@ -1430,10 +1549,11 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                     else -1
                 )
+                v_head_dim_s = getattr(layer, "v_head_dim", None) or layer.head_dim
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                    v.view(-1, layer.tp_v_head_num, v_head_dim_s),
                     causal=causal,
                     sm_scale=layer.scaling,
                     window_left=swa_window_left,
@@ -1451,7 +1571,11 @@ class FlashInferAttnBackend(AttentionBackend):
                     v_scale=layer.v_scale_float,
                 )
 
-                o, _ = _safe_merge_state(o1, s1, o2, s2)
+                if sinks is not None:
+                    o, lse_merged = _safe_merge_state(o1, s1, o2, s2)
+                    o = self._apply_attention_sinks(o, lse_merged, sinks, forward_batch)
+                else:
+                    o, _ = _safe_merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
                 self.token_to_kv_pool.set_kv_buffer(
@@ -1462,7 +1586,42 @@ class FlashInferAttnBackend(AttentionBackend):
                     *self._kv_write_scales(layer),
                 )
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        v_head_dim = getattr(layer, "v_head_dim", None) or layer.head_dim
+        return o.view(-1, layer.tp_q_head_num * v_head_dim)
+
+    @staticmethod
+    def _apply_attention_sinks(o, lse, sinks, forward_batch):
+        """Attention-sink correction for FlashInfer prefill.
+
+        FlashInfer normalizes the softmax over KV logits only; a sink logit
+        competes in the denominator, so with lse_kv = log(sum_kv exp(l)):
+
+            out_corrected = out_kv * exp(lse_kv) / (exp(lse_kv) + exp(sink))
+                          = out_kv / (1 + exp(sink - lse_kv))
+
+        ``lse`` from the varlen batch prefill is (B, H, max_q) fp32; q tokens
+        map to (batch, q_pos) through the batch's extend sequence lengths.
+        """
+        import torch  # local: keep module import graph unchanged
+
+        sinks_f = sinks.to(torch.float32).view(1, -1)
+        if lse.dim() == 3:
+            seq_lens = forward_batch.extend_seq_lens_cpu
+            total_q = o.shape[0]
+            device = o.device
+            lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
+            b_idx = torch.repeat_interleave(
+                torch.arange(len(seq_lens), dtype=torch.int64, device=device), lens
+            )
+            starts = torch.cat(
+                [torch.zeros(1, dtype=torch.int64, device=device), torch.cumsum(lens, 0)[:-1]]
+            )
+            pos = torch.arange(total_q, dtype=torch.int64, device=device) - starts[b_idx]
+            lse_sel = lse[b_idx, :, pos].transpose(0, 1)  # (total_q, H)
+        else:
+            lse_sel = lse.view(o.shape[0], -1).to(torch.float32)
+        corr = torch.sigmoid(lse_sel - sinks_f)  # (total_q, H)
+        return (o.float() * corr.unsqueeze(-1)).to(o.dtype)
 
     @debug_kernel_api
     def forward_decode(
@@ -1473,7 +1632,12 @@ class FlashInferAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sinks=None,
     ):
+        if getattr(self, "decode_as_extend", False):
+            return self.forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache, sinks
+            )
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -1549,6 +1713,10 @@ class FlashInferIndicesUpdaterDecode:
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
         self.head_dim = model_runner.model_config.head_dim
+        self.v_head_dim = (
+            getattr(model_runner.model_config, "v_head_dim", None)
+            or model_runner.model_config.head_dim
+        )
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
@@ -1830,6 +1998,10 @@ class FlashInferIndicesUpdaterPrefill:
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
         self.head_dim = model_runner.model_config.head_dim
+        self.v_head_dim = (
+            getattr(model_runner.model_config, "v_head_dim", None)
+            or model_runner.model_config.head_dim
+        )
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
@@ -2217,6 +2389,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
+                head_dim_vo=self.v_head_dim,
                 q_data_type=self.q_data_type,
             )
 
@@ -2298,6 +2471,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.num_kv_heads,
             self.head_dim,
             1,
+            head_dim_vo=self.v_head_dim,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
             custom_mask=use_custom_mask,

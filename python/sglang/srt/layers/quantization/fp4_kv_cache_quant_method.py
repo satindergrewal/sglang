@@ -570,15 +570,26 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         return self.k_scales_float[layer_id], self.v_scales_float[layer_id]
 
     def create_buffers(
-        self, size: int, head_num: int, head_dim: int, layer_num: int, device: str
+        self, size: int, head_num: int, head_dim: int, layer_num: int, device: str,
+        v_head_dim: Optional[int] = None,
     ) -> dict:
         m = size
         n = head_num
         k = head_dim
+        # Asymmetric V head dims (MiMo-V2.6's 192 K / 128 V, Qwen3.5): the V
+        # side flows at its natural width end to end — packed buffer, scales,
+        # and the dequant workspace — or the prefill kernel's register budget
+        # sees a padded V and rejects the tiling config.
+        vk = v_head_dim if v_head_dim is not None else head_dim
         store_dtype = self.kv_storage_dtype()
         dq_dtype = self.dequant_workspace_dtype()
         needs_linear_scales = self.needs_linear_scale_buffer()
         needs_native_scales = self.needs_native_fp4_scales()
+        if needs_native_scales and vk != head_dim:
+            raise NotImplementedError(
+                "Native NVFP4 (TRT-LLM GenMHA) scale layout requires equal "
+                f"K/V head dims, got {head_dim}/{vk}."
+            )
 
         if needs_native_scales:
             if self.page_size % 4 != 0:
@@ -601,7 +612,7 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
             for _ in range(layer_num)
         ]
         v_buffer = [
-            torch.zeros((m, n, k // 2), dtype=store_dtype, device=device)
+            torch.zeros((m, n, vk // 2), dtype=store_dtype, device=device)
             for _ in range(layer_num)
         ]
         k_scale_buffer = (
@@ -619,7 +630,7 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         v_scale_buffer = (
             [
                 torch.zeros(
-                    (m, n, k // self.SCALE_BLOCK_SIZE),
+                    (m, n, vk // self.SCALE_BLOCK_SIZE),
                     dtype=store_dtype,
                     device=device,
                 )
@@ -657,7 +668,7 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
             else None
         )
         dq_v_buffer = (
-            torch.zeros((m, n, k), dtype=dq_dtype, device=device)
+            torch.zeros((m, n, vk), dtype=dq_dtype, device=device)
             if dq_dtype is not None
             else None
         )
@@ -1004,6 +1015,10 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
         _dq_workspace(_PREFILL, _NVFP4_DQ_KV_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3),
         _native_fp4(_PREFILL, _NVFP4_KV_PREFILL_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
         _native_fp4(_DECODE, _NVFP4_KV_DECODE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
+        # FlashInfer decode over the FP8 dequant workspace: the escape hatch
+        # for asymmetric K/V head dims (MiMo-V2.6 192K/128V) whose native
+        # XQA decode kernel assumes symmetric packed widths.
+        _dq_workspace(_DECODE, "flashinfer", _NVFP4_SCALE, _FP8_E4M3),
     ),
     FP4MXBlock16KVCacheMethod.name: (
         _plain(_PREFILL, _FP4_MX_PREFILL_BACKENDS, _FP4_MX_SCALE, _BF16),
