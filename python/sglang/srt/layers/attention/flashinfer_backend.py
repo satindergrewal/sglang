@@ -1038,11 +1038,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_cpu,
                 forward_batch.seq_lens_sum,
-                # The paged plan must cover the FULL sequence (prefix + the
-                # just-written token, whose rows are already in the dequant
-                # workspace); prefix-only here would drop the current token
-                # from every decode step's attention.
-                forward_batch.seq_lens,
+                # prefix = seq - 1: qo_indptr gets one query per request,
+                # while kv_indptr comes from dq_paged_kernel_lens (the full
+                # sequence — the dequant workspace holds prefix + current).
+                forward_batch.extend_prefix_lens,
                 prefill_wrappers=self.prefill_wrappers_paged,
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
