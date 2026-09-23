@@ -1815,6 +1815,13 @@ class KVCacheConfigurator:
             if self.draft_swa_full_capacity
             else swa_max_total_num_tokens
         )
+        # Quantized KV recipes (nvfp4/fp4_mx_block16) own the packed buffer
+        # shapes via their quant method — wire it through exactly like
+        # _build_mha_kv_pool does, or the inner pools fall back to
+        # torch.zeros on the raw fp4 dtype (no CUDA fill kernel).
+        quant_method = self._build_mha_quant_method(
+            num_layers=self.layer_info.num_effective_layers
+        )
         token_to_kv_pool = SWAKVPool(
             size=full_max_total_num_tokens,
             size_swa=size_swa,
@@ -1830,6 +1837,7 @@ class KVCacheConfigurator:
             device=self.device,
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
             token_to_kv_pool_class=swa_pool_class,
+            quant_method=quant_method,
             **kwargs,
         )
         return token_to_kv_pool

@@ -1297,22 +1297,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     def _reshape_paged_kv_cache(
         self,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
+        cache: torch.Tensor,
         layer: RadixAttention,
         head_dim: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        k_cache = k_cache.view(
+    ) -> torch.Tensor:
+        cache = cache.view(
             -1, self.page_size, layer.tp_k_head_num, head_dim
         ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, head_dim
-        ).permute(0, 2, 1, 3)
         if layer.tp_k_head_num == 1:
-            k_cache = canonicalize_stride(k_cache)
-        if layer.tp_v_head_num == 1:
-            v_cache = canonicalize_stride(v_cache)
-        return k_cache, v_cache
+            cache = canonicalize_stride(cache)
+        return cache
 
     def _get_nvfp4_bmm_scales(self, layer: RadixAttention) -> tuple[float, float]:
         assert self.is_nvfp4_kvcache
@@ -1413,19 +1407,22 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             k_fp4, v_fp4, k_scale, v_scale = _trtllm_native_nvfp4_kv_buffer(
                 self.token_to_kv_pool, layer.layer_id
             )
-        kv_cache = self._reshape_paged_kv_cache(
-            k_fp4, v_fp4, layer, layer.head_dim // 2
-        )
+        # Asymmetric v_head_dim (MiMo-V2.6 192K/128V): V rows are packed at
+        # v_head_dim, K at head_dim.
+        v_head_dim_packed = (getattr(layer, "v_head_dim", None) or layer.head_dim) // 2
+        k_cache = self._reshape_paged_kv_cache(k_fp4, layer, layer.head_dim // 2)
+        v_cache = self._reshape_paged_kv_cache(v_fp4, layer, v_head_dim_packed)
         if self.is_xqa_impl:
-            kv_cache_block_scales = self._reshape_paged_kv_cache(
-                k_scale, v_scale, layer, layer.head_dim // 16
-            )
+            v_scale_dim = (getattr(layer, "v_head_dim", None) or layer.head_dim) // 16
+            k_scale_r = self._reshape_paged_kv_cache(k_scale, layer, layer.head_dim // 16)
+            v_scale_r = self._reshape_paged_kv_cache(v_scale, layer, v_scale_dim)
+            kv_cache_block_scales = (k_scale_r, v_scale_r)
         else:
             # SM100 native scale buffers are already physical HND with
             # contiguous [page-token, block-scale] dimensions. V is
             # four-token interleaved.
             kv_cache_block_scales = (k_scale, v_scale)
-        return kv_cache, kv_cache_block_scales
+        return (k_cache, v_cache), kv_cache_block_scales
 
     def forward_decode(
         self,
@@ -1485,9 +1482,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
         else:
             k_cache, v_cache = pool.get_kv_buffer(layer.layer_id)
-            kv_cache = self._reshape_paged_kv_cache(
-                k_cache, v_cache, layer, layer.head_dim
+            k_head = layer.head_dim // 2 if self.is_nvfp4_kvcache else layer.head_dim
+            v_head = (
+                (getattr(layer, "v_head_dim", None) or layer.head_dim) // 2
+                if self.is_nvfp4_kvcache
+                else layer.head_dim
             )
+            k_cache = self._reshape_paged_kv_cache(k_cache, layer, k_head)
+            v_cache = self._reshape_paged_kv_cache(v_cache, layer, v_head)
             kv_cache_block_scales = None
 
         if self.is_nvfp4_kvcache:
@@ -1524,7 +1526,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self.decode_uses_native_fp4 and not self.is_xqa_impl:
             o = self._finalize_nvfp4_output(o, forward_batch)
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        # Asymmetric v_head_dim (MiMo-V2.6 192K/128V): the XQA kernel writes
+        # query-width outputs; the real value width is v_head_dim.
+        v_head_dim = getattr(layer, "v_head_dim", None) or layer.head_dim
+        o = o[..., :v_head_dim]
+        return o.reshape(-1, layer.tp_q_head_num * v_head_dim)
 
     def forward_extend(
         self,
@@ -1613,8 +1619,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
             if not self.use_fmha_v2 or is_decode_mode:
                 # Decode and SM100 batch_context kernels require HND layout.
-                k_cache, v_cache = self._reshape_paged_kv_cache(
-                    k_cache_raw, v_cache_raw, layer, layer.head_dim
+                k_cache = self._reshape_paged_kv_cache(
+                    k_cache_raw, layer, layer.head_dim
+                )
+                v_cache = self._reshape_paged_kv_cache(
+                    v_cache_raw, layer, layer.head_dim
                 )
             else:
                 k_cache = k_cache_raw.view(

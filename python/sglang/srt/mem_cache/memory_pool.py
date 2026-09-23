@@ -1845,8 +1845,15 @@ class KVCache(abc.ABC):
         self.kernel_page_blocks = 1
         self.dtype = dtype
         self.device = device
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        if dtype in (
+            torch.float8_e5m2,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+            getattr(torch, "float4_e2m1fn_x2", None),
+        ):
             # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
+            # and torch.zeros/fill_ is not implemented for float4_e2m1fn_x2
+            # (nvfp4 KV); the packed byte layout is identical (itemsize 1).
             self.store_dtype = torch.uint8
         else:
             self.store_dtype = dtype
@@ -2181,6 +2188,7 @@ class MHATokenToKVPool(KVCache):
                     self.head_dim,
                     self.layer_num,
                     self.device,
+                    v_head_dim=getattr(self, "v_head_dim", None),
                 )
         self.k_buffer = buf["k_buffer"]
         self.v_buffer = buf["v_buffer"]
@@ -2836,9 +2844,10 @@ class MHATokenToKVPool(KVCache):
             )
 
         k_buffer_dq, v_buffer_dq = self.get_dequant_workspace()
+        v_head_dim = getattr(layer, "v_head_dim", None) or layer.head_dim
         return (
             k_buffer_dq.view(-1, layer.tp_k_head_num, layer.head_dim),
-            v_buffer_dq.view(-1, layer.tp_v_head_num, layer.head_dim),
+            v_buffer_dq.view(-1, layer.tp_v_head_num, v_head_dim),
         )
 
     def get_flashinfer_decode_dequant_workspace_kv_buffer(
@@ -2863,9 +2872,10 @@ class MHATokenToKVPool(KVCache):
             seq_lens,
         )
         k_buffer_dq, v_buffer_dq = self.get_dequant_workspace()
+        v_head_dim = getattr(layer, "v_head_dim", None) or layer.head_dim
         return (
             k_buffer_dq.view(-1, layer.tp_k_head_num, layer.head_dim),
-            v_buffer_dq.view(-1, layer.tp_v_head_num, layer.head_dim),
+            v_buffer_dq.view(-1, layer.tp_v_head_num, v_head_dim),
         )
 
     @staticmethod

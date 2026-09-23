@@ -1236,6 +1236,12 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         vision_config = getattr(config, "vision_config", None)
         audio_config = getattr(config, "audio_config", None)
         self._is_multimodal = vision_config is not None and audio_config is not None
+        # Text-only opt-out (e.g. --json-model-override-args
+        # '{"enable_multimodal": false}'): skip the vision/audio encoders
+        # entirely so a language-only deployment needs no ffmpeg/torchcodec
+        # and no tower weights.
+        if self._is_multimodal and getattr(config, "enable_multimodal", None) is False:
+            self._is_multimodal = False
         # Always build vision/audio encoders so P can fall back to local
         # encoding when the EPD encoder is unreachable.
         if self._is_multimodal:

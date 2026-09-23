@@ -75,16 +75,25 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
         )
 
     explicit_decode_backend = cfg.decode_attention_backend
-    if explicit_decode_backend not in (None, "trtllm_mha"):
+    # Decode implementations: trtllm_mha reads native FP4 (symmetric K/V
+    # head dims only); FlashInfer decode over the FP8 dequant workspace
+    # supports asymmetric K/V head dims (MiMo-V2.6's 192K/128V).
+    if explicit_decode_backend == "flashinfer":
+        decode_backend = "flashinfer"
+        updates_decode = "flashinfer"
+    elif explicit_decode_backend in (None, "trtllm_mha"):
+        decode_backend = "trtllm_mha"
+        updates_decode = "trtllm_mha"
+    else:
         raise ValueError(
-            "NVFP4 decode requires --decode-attention-backend=trtllm_mha; got "
-            f"{explicit_decode_backend!r}. Remove the backend option; NVFP4 "
-            "selects the supported decode implementation automatically."
+            "NVFP4 decode requires --decode-attention-backend=trtllm_mha "
+            f"(native FP4) or flashinfer (FP8 dequant workspace); got "
+            f"{explicit_decode_backend!r}."
         )
 
     updates = {
         "prefill_attention_backend": target_prefill_backend,
-        "decode_attention_backend": "trtllm_mha",
+        "decode_attention_backend": updates_decode,
     }
     if cfg.prefill_kv_cache_dequant_dtype == "auto":
         updates["prefill_kv_cache_dequant_dtype"] = requested_dtype
@@ -308,6 +317,11 @@ def handle_kv4_compatibility(server_args: Any) -> None:
                         "torch_native",
                         "flex_attention",
                         "trtllm_mha",
+                        # NVFP4 KV + FlashInfer decode over the FP8 dequant
+                        # workspace: supports asymmetric K/V head dims
+                        # (MiMo-V2.6's 192K/128V) that the native XQA decode
+                        # kernel cannot read.
+                        "flashinfer",
                     ]
                     assert attention_backend in KV4_ATTENTION_MHA_BACKEND_CHOICES, (
                         f"KV4 MHA expects attention_backend to be one of "

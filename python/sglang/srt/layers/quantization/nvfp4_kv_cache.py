@@ -68,63 +68,83 @@ def _store_nvfp4_kv_kernel(
     v_scale_native_dst,
     loc_stride: tl.constexpr,
     num_heads: tl.constexpr,
-    packed_dim: tl.constexpr,
-    scale_dim: tl.constexpr,
+    packed_dim_k: tl.constexpr,
+    packed_dim_v: tl.constexpr,
+    scale_dim_k: tl.constexpr,
+    scale_dim_v: tl.constexpr,
     page_size: tl.constexpr,
-    BLOCK_PACKED: tl.constexpr,
-    BLOCK_SCALE: tl.constexpr,
+    BLOCK_PACKED_K: tl.constexpr,
+    BLOCK_PACKED_V: tl.constexpr,
+    BLOCK_SCALE_K: tl.constexpr,
+    BLOCK_SCALE_V: tl.constexpr,
     STORE_LINEAR: tl.constexpr,
     STORE_NATIVE: tl.constexpr,
 ):
+    # K and V carry separate packed/scale widths: asymmetric v_head_dim
+    # (MiMo-V2.6 192K/128V) packs K into head_dim/2 bytes and V into
+    # v_head_dim/2.
     token_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
     slot = tl.load(loc + token_idx * loc_stride).to(tl.int64)
 
-    packed_offsets = tl.arange(0, BLOCK_PACKED)
-    packed_mask = packed_offsets < packed_dim
-    src_packed_base = (token_idx * num_heads + head_idx) * packed_dim
-    dst_packed_base = (slot * num_heads + head_idx) * packed_dim
-    k_packed = tl.load(k_src + src_packed_base + packed_offsets, mask=packed_mask)
-    v_packed = tl.load(v_src + src_packed_base + packed_offsets, mask=packed_mask)
-    tl.store(k_dst + dst_packed_base + packed_offsets, k_packed, mask=packed_mask)
-    tl.store(v_dst + dst_packed_base + packed_offsets, v_packed, mask=packed_mask)
+    row_src_k = (token_idx * num_heads + head_idx) * packed_dim_k
+    row_dst_k = (slot * num_heads + head_idx) * packed_dim_k
+    packed_offsets_k = tl.arange(0, BLOCK_PACKED_K)
+    packed_mask_k = packed_offsets_k < packed_dim_k
+    k_packed = tl.load(k_src + row_src_k + packed_offsets_k, mask=packed_mask_k)
+    tl.store(k_dst + row_dst_k + packed_offsets_k, k_packed, mask=packed_mask_k)
 
-    scale_offsets = tl.arange(0, BLOCK_SCALE)
-    scale_mask = scale_offsets < scale_dim
-    src_scale_base = (token_idx * num_heads + head_idx) * scale_dim
-    k_scale = tl.load(k_scale_src + src_scale_base + scale_offsets, mask=scale_mask)
-    v_scale = tl.load(v_scale_src + src_scale_base + scale_offsets, mask=scale_mask)
+    row_src_v = (token_idx * num_heads + head_idx) * packed_dim_v
+    row_dst_v = (slot * num_heads + head_idx) * packed_dim_v
+    packed_offsets_v = tl.arange(0, BLOCK_PACKED_V)
+    packed_mask_v = packed_offsets_v < packed_dim_v
+    v_packed = tl.load(v_src + row_src_v + packed_offsets_v, mask=packed_mask_v)
+    tl.store(v_dst + row_dst_v + packed_offsets_v, v_packed, mask=packed_mask_v)
+
+    scale_offsets_k = tl.arange(0, BLOCK_SCALE_K)
+    scale_mask_k = scale_offsets_k < scale_dim_k
+    src_scale_base_k = (token_idx * num_heads + head_idx) * scale_dim_k
+    k_scale = tl.load(k_scale_src + src_scale_base_k + scale_offsets_k, mask=scale_mask_k)
+    scale_offsets_v = tl.arange(0, BLOCK_SCALE_V)
+    scale_mask_v = scale_offsets_v < scale_dim_v
+    src_scale_base_v = (token_idx * num_heads + head_idx) * scale_dim_v
+    v_scale = tl.load(v_scale_src + src_scale_base_v + scale_offsets_v, mask=scale_mask_v)
 
     if STORE_LINEAR:
-        dst_scale_base = (slot * num_heads + head_idx) * scale_dim
+        dst_scale_base_k = (slot * num_heads + head_idx) * scale_dim_k
         tl.store(
-            k_scale_linear_dst + dst_scale_base + scale_offsets,
+            k_scale_linear_dst + dst_scale_base_k + scale_offsets_k,
             k_scale,
-            mask=scale_mask,
+            mask=scale_mask_k,
         )
+        dst_scale_base_v = (slot * num_heads + head_idx) * scale_dim_v
         tl.store(
-            v_scale_linear_dst + dst_scale_base + scale_offsets,
+            v_scale_linear_dst + dst_scale_base_v + scale_offsets_v,
             v_scale,
-            mask=scale_mask,
+            mask=scale_mask_v,
         )
 
     if STORE_NATIVE:
         page = slot // page_size
         token_offset = slot % page_size
-        native_page_head_base = (page * num_heads + head_idx) * page_size * scale_dim
-
+        native_page_head_base_k = (
+            (page * num_heads + head_idx) * page_size * scale_dim_k
+        )
         k_native_offset = (
-            native_page_head_base + token_offset * scale_dim + scale_offsets
+            native_page_head_base_k + token_offset * scale_dim_k + scale_offsets_k
         )
-        tl.store(k_scale_native_dst + k_native_offset, k_scale, mask=scale_mask)
+        tl.store(k_scale_native_dst + k_native_offset, k_scale, mask=scale_mask_k)
 
-        scale_group = scale_dim // 4
-        swizzled_token = (token_offset // 4) * 4 + scale_offsets // scale_group
-        swizzled_scale = (scale_offsets % scale_group) * 4 + token_offset % 4
-        v_native_offset = (
-            native_page_head_base + swizzled_token * scale_dim + swizzled_scale
+        native_page_head_base_v = (
+            (page * num_heads + head_idx) * page_size * scale_dim_v
         )
-        tl.store(v_scale_native_dst + v_native_offset, v_scale, mask=scale_mask)
+        scale_group = scale_dim_v // 4
+        swizzled_token = (token_offset // 4) * 4 + scale_offsets_v // scale_group
+        swizzled_scale = (scale_offsets_v % scale_group) * 4 + token_offset % 4
+        v_native_offset = (
+            native_page_head_base_v + swizzled_token * scale_dim_v + swizzled_scale
+        )
+        tl.store(v_scale_native_dst + v_native_offset, v_scale, mask=scale_mask_v)
 
 
 def store_nvfp4_kv_cache(
@@ -151,29 +171,23 @@ def store_nvfp4_kv_cache(
     if not (store_linear or store_native):
         raise ValueError("At least one NVFP4 scale layout must be selected.")
 
-    num_tokens, num_heads, packed_dim = k_src.shape
-    scale_dim = k_scale_src.shape[-1]
+    num_tokens, num_heads, packed_dim_k = k_src.shape
+    packed_dim_v = v_src.shape[-1]
+    scale_dim_k = k_scale_src.shape[-1]
+    scale_dim_v = v_scale_src.shape[-1]
     if store_native:
         if page_size % 4 != 0:
             raise ValueError(
                 f"Native NVFP4 requires page_size divisible by 4, got {page_size}."
             )
-        if scale_dim % 4 != 0:
+        if scale_dim_k % 4 != 0 or scale_dim_v % 4 != 0:
             raise ValueError(
                 "Native NVFP4 requires head_dim divisible by 64; "
-                f"got scale_dim={scale_dim} (head_dim={scale_dim * 16})."
+                f"got scale_dim_k={scale_dim_k}, scale_dim_v={scale_dim_v}."
             )
-    expected_data_shape = (num_tokens, num_heads, packed_dim)
-    expected_scale_shape = (num_tokens, num_heads, scale_dim)
-    if v_src.shape != expected_data_shape:
-        raise ValueError(f"K/V packed shapes differ: {k_src.shape} vs {v_src.shape}.")
-    if (
-        k_scale_src.shape != expected_scale_shape
-        or v_scale_src.shape != expected_scale_shape
-    ):
+    if v_src.shape[:2] != k_src.shape[:2] or v_scale_src.shape[:2] != k_src.shape[:2]:
         raise ValueError(
-            "Unexpected NVFP4 scale shapes: "
-            f"K={k_scale_src.shape}, V={v_scale_src.shape}, expected={expected_scale_shape}."
+            f"K/V batch/head shapes differ: {k_src.shape} vs {v_src.shape}."
         )
     if loc.numel() != num_tokens:
         raise ValueError(f"loc has {loc.numel()} entries for {num_tokens} KV rows.")
@@ -197,11 +211,15 @@ def store_nvfp4_kv_cache(
         native_v,
         loc_stride=loc.stride(0),
         num_heads=num_heads,
-        packed_dim=packed_dim,
-        scale_dim=scale_dim,
+        packed_dim_k=packed_dim_k,
+        packed_dim_v=packed_dim_v,
+        scale_dim_k=scale_dim_k,
+        scale_dim_v=scale_dim_v,
         page_size=page_size,
-        BLOCK_PACKED=triton.next_power_of_2(packed_dim),
-        BLOCK_SCALE=triton.next_power_of_2(scale_dim),
+        BLOCK_PACKED_K=triton.next_power_of_2(packed_dim_k),
+        BLOCK_PACKED_V=triton.next_power_of_2(packed_dim_v),
+        BLOCK_SCALE_K=triton.next_power_of_2(scale_dim_k),
+        BLOCK_SCALE_V=triton.next_power_of_2(scale_dim_v),
         STORE_LINEAR=store_linear,
         STORE_NATIVE=store_native,
         num_warps=4,
