@@ -662,12 +662,25 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
             else None
         )
         # Shared dequant workspace: one copy, reused per layer during prefill.
+        # The b-side copy serves the hybrid SWA decode path, whose SWA and
+        # full wrappers need TWO coexisting workspaces (different pools feed
+        # them: SWA ring slots vs full-pool slots).
         dq_k_buffer = (
             torch.zeros((m, n, k), dtype=dq_dtype, device=device)
             if dq_dtype is not None
             else None
         )
         dq_v_buffer = (
+            torch.zeros((m, n, vk), dtype=dq_dtype, device=device)
+            if dq_dtype is not None
+            else None
+        )
+        dq_k_buffer_b = (
+            torch.zeros((m, n, k), dtype=dq_dtype, device=device)
+            if dq_dtype is not None
+            else None
+        )
+        dq_v_buffer_b = (
             torch.zeros((m, n, vk), dtype=dq_dtype, device=device)
             if dq_dtype is not None
             else None
@@ -682,6 +695,8 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
             "native_v_scale_buffer": native_v_scale_buffer,
             "dq_k_buffer": dq_k_buffer,
             "dq_v_buffer": dq_v_buffer,
+            "dq_k_buffer_b": dq_k_buffer_b,
+            "dq_v_buffer_b": dq_v_buffer_b,
             "store_dtype": store_dtype,
         }
 
