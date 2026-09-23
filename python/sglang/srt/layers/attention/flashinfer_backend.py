@@ -1703,7 +1703,11 @@ class FlashInferAttnBackend(AttentionBackend):
             "q": q.detach().clone(),
             "k": k.detach().clone(),
             "v": v.detach().clone(),
-            "kv_cache": kv_cache.detach().clone(),
+            "kv_cache": (
+                tuple(t.detach().clone() for t in kv_cache)
+                if isinstance(kv_cache, tuple)
+                else kv_cache.detach().clone()
+            ),
             "o1": o1.detach().clone(),
             "s1": s1.detach().clone(),
             "o2": o2.detach().clone(),
