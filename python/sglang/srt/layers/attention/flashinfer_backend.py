@@ -2470,7 +2470,13 @@ class FlashInferIndicesUpdaterPrefill:
                 q_data_type=self.q_data_type,
             )
 
-        if use_sliding_window_kv_pool and not use_swa_source:
+        if (
+            use_sliding_window_kv_pool
+            and not use_swa_source
+            # Custom KV indices are dequant-workspace row tables (already
+            # kernel-facing); they never hold full-pool locs to translate.
+            and custom_kv_indices is None
+        ):
             assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = (
