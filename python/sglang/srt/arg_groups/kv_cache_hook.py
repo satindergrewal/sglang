@@ -79,17 +79,27 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
     # head dims only); FlashInfer decode over the FP8 dequant workspace
     # supports asymmetric K/V head dims (MiMo-V2.6's 192K/128V).
     if explicit_decode_backend == "flashinfer":
-        decode_backend = "flashinfer"
         updates_decode = "flashinfer"
     elif explicit_decode_backend in (None, "trtllm_mha"):
-        decode_backend = "trtllm_mha"
-        updates_decode = "trtllm_mha"
+        updates_decode = None  # auto-select below (asym-aware)
     else:
         raise ValueError(
             "NVFP4 decode requires --decode-attention-backend=trtllm_mha "
             f"(native FP4) or flashinfer (FP8 dequant workspace); got "
             f"{explicit_decode_backend!r}."
         )
+
+    if updates_decode is None:
+        # Auto-select: the native XQA decode kernel reads K and V with the
+        # same packed width, so models with asymmetric K/V head dims
+        # (MiMo-V2.6's 192K/128V) decode through FlashInfer over the FP8
+        # dequant workspace instead.
+        model_config = model_config_of(server_args)
+        v_head_dim = getattr(model_config.hf_text_config, "v_head_dim", None)
+        if v_head_dim is not None and v_head_dim != model_config.hf_text_config.head_dim:
+            updates_decode = "flashinfer"
+        else:
+            updates_decode = "trtllm_mha"
 
     updates = {
         "prefill_attention_backend": target_prefill_backend,
