@@ -352,6 +352,15 @@ class FlashInferAttnBackend(AttentionBackend):
             and model_runner.model_config.v_head_dim
             != model_runner.model_config.head_dim
         )
+        logger.info(
+            "FlashInfer init: dq_ws=%s decode_as_extend=%s v_head=%s head=%s "
+            "decode_access=%s",
+            self.decode_uses_dequant_workspace,
+            self.decode_as_extend,
+            model_runner.model_config.v_head_dim,
+            model_runner.model_config.head_dim,
+            getattr(self.decode_kv_access, "kind", None),
+        )
         self.is_nvfp4_kvcache = any(
             access is not None and access.scale_recipe == "nvfp4"
             for access in (self.prefill_kv_access, self.decode_kv_access)
