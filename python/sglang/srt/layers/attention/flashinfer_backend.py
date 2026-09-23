@@ -1630,7 +1630,24 @@ class FlashInferAttnBackend(AttentionBackend):
                     o, lse_merged = _safe_merge_state(o1, s1, o2, s2)
                     o = self._apply_attention_sinks(o, lse_merged, sinks, forward_batch)
                 else:
-                    o, _ = _safe_merge_state(o1, s1, o2, s2)
+                    o, lse_merged_dbg = _safe_merge_state(o1, s1, o2, s2)
+                    o = o
+
+                self._nvfp4_debug_dump(
+                    layer,
+                    forward_batch,
+                    q,
+                    k,
+                    v,
+                    kv_cache,
+                    prefill_wrapper_paged,
+                    o1,
+                    s1,
+                    o2,
+                    s2,
+                    sinks,
+                    o,
+                )
 
             if save_kv_cache:
                 self.token_to_kv_pool.set_kv_buffer(
@@ -1643,6 +1660,88 @@ class FlashInferAttnBackend(AttentionBackend):
 
         v_head_dim = getattr(layer, "v_head_dim", None) or layer.head_dim
         return o.view(-1, layer.tp_q_head_num * v_head_dim)
+
+    def _nvfp4_debug_dump(
+        self,
+        layer,
+        forward_batch,
+        q,
+        k,
+        v,
+        kv_cache,
+        paged_wrapper,
+        o1,
+        s1,
+        o2,
+        s2,
+        sinks,
+        o,
+    ):
+        """One-shot decode-as-extend probe (SGLANG_NVFP4_DEBUG_LAYERS="0,1")."""
+        import os
+
+        targets = os.environ.get("SGLANG_NVFP4_DEBUG_LAYERS", "")
+        if not targets or not getattr(self, "decode_as_extend", False):
+            return
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return
+        if str(layer.layer_id) not in targets.split(","):
+            return
+        step = getattr(self, "_nvfp4_dbg_step", 0)
+        self._nvfp4_dbg_step = step + 1
+        if step > 0:
+            return
+        out_dir = "/tmp/nvfp4_dbg"
+        os.makedirs(out_dir, exist_ok=True)
+        pool = self.token_to_kv_pool
+        req_to_token = self.req_to_token_pool.req_to_token
+        dump = {
+            "layer_id": layer.layer_id,
+            "is_swa": layer.sliding_window_size is not None
+            and layer.sliding_window_size != -1,
+            "sliding_window": layer.sliding_window_size,
+            "q": q.detach().clone(),
+            "k": k.detach().clone(),
+            "v": v.detach().clone(),
+            "kv_cache": kv_cache.detach().clone(),
+            "o1": o1.detach().clone(),
+            "s1": s1.detach().clone(),
+            "o2": o2.detach().clone(),
+            "s2": s2.detach().clone(),
+            "sinks": sinks.detach().clone() if sinks is not None else None,
+            "o": o.detach().clone(),
+            "seq_lens_cpu": forward_batch.seq_lens_cpu,
+            "req_pool_indices_cpu": forward_batch.req_pool_indices.cpu(),
+            "req_to_token": req_to_token[
+                forward_batch.req_pool_indices.cpu()
+            ].cpu(),
+            "paged_kv_indptr": paged_wrapper._paged_kv_indptr_buf.cpu(),
+            "paged_kv_indices": paged_wrapper._paged_kv_indices_buf.cpu(),
+        }
+        # Raw FP4 ground truth for the planned prefix rows.
+        try:
+            layer_id_pool = None
+            if pool.__class__.__name__ == "SWAKVPool":
+                layer_id_pool, is_swa = pool.layers_mapping[layer.layer_id]
+                inner = pool.swa_kv_pool if is_swa else pool.full_kv_pool
+            else:
+                inner = pool
+            raw_k, raw_v, raw_ks, raw_vs = inner.get_raw_kv_buffer(
+                layer_id_pool if layer_id_pool is not None else layer.layer_id
+            )
+            gs_k = inner.quant_method.k_scales_gpu[layer.layer_id]
+            gs_v = inner.quant_method.v_scales_gpu[layer.layer_id]
+            dump["raw_k"] = raw_k.detach().cpu().clone()
+            dump["raw_v"] = raw_v.detach().cpu().clone()
+            dump["raw_ks"] = raw_ks.detach().cpu().clone()
+            dump["raw_vs"] = raw_vs.detach().cpu().clone()
+            dump["global_scale_k"] = float(gs_k)
+            dump["global_scale_v"] = float(gs_v)
+        except Exception as exc:  # pragma: no cover
+            dump["raw_error"] = repr(exc)
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        torch.save(dump, f"{out_dir}/layer{layer.layer_id}_r{rank}.pt")
+        logger.warning("nvfp4 debug dump: layer %s written", layer.layer_id)
 
     @staticmethod
     def _apply_attention_sinks(o, lse, sinks, forward_batch):
