@@ -43,6 +43,10 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from sglang.srt.layers.moe.moe_runner.base import (
+    DispatchMoeRunnerCore,
+    MoeRunnerConfig,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -652,6 +656,35 @@ class ExL3HeadMethod(ExL3LinearMethod):
         return F.embedding(input_, layer.weight)
 
 
+class ExL3MoeRunnerCore(DispatchMoeRunnerCore):
+    """Packed-trellis MoE runner core.
+
+    Consumes the standard dispatch output (hidden states + localized topk)
+    directly and runs the EXL3 trellis kernels per active expert — weights
+    never leave their packed quantized form. EP-localized topk ids arrive
+    with -1 for remote experts (StandardDispatcher handles the mapping);
+    remote pairs contribute nothing on this rank and the per-layer all-reduce
+    combines the partial sums.
+    """
+
+    def __init__(self, config: MoeRunnerConfig, method: "ExL3MoEMethod"):
+        super().__init__(config)
+        self._method = method
+
+    @property
+    def runner_backend(self) -> Any:
+        return "exl3"
+
+    def run_from_dispatch(
+        self,
+        dispatch_output: Any,
+        quant_info: Any,
+        runner_config: MoeRunnerConfig,
+        hooks: Any = None,
+    ) -> Any:
+        return self._method.run_packed_moe(dispatch_output, runner_config)
+
+
 class ExL3MoEMethod(FusedMoEMethodBase):
     """EXL3 routed experts on FusedMoE.
 
@@ -682,6 +715,16 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         self.hidden_size = None
         self.intermediate_size = None
         self.params_dtype = None
+        # Packed mode keeps per-expert trellis/suh/svh on GPU and runs the
+        # EXL3 kernels per active expert instead of materializing fp16
+        # experts. Opt in with SGLANG_EXL3_MOE_PACKED=1; required for
+        # tp/ep > 1 (sharding applies to packed experts, not fp16 copies).
+        self.packed = (
+            os.environ.get("SGLANG_EXL3_MOE_PACKED", "0") == "1"
+            and os.environ.get("EXL3_NO_KERNEL") != "1"
+            and hasattr(torch.ops.sgl_kernel, "sgl_exl3_had_in")
+        )
+        self._packed_state = None
 
     # -- parameters ---------------------------------------------------------
 
@@ -733,10 +776,13 @@ class ExL3MoEMethod(FusedMoEMethodBase):
 
     @torch.no_grad()
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.packed:
+            self._process_packed(layer)
+            return
         if layer.moe_ep_size != 1 or layer.moe_tp_size != 1:
             raise NotImplementedError(
                 "exl3 MoE: TP/EP sharding of packed trellis experts is not "
-                "supported yet; run with tp=1 ep=1"
+                "supported yet; run with tp=1 ep=1 (or SGLANG_EXL3_MOE_PACKED=1)"
             )
         recs = layer._exl3_moe_records
         E = layer.num_local_experts
@@ -823,6 +869,138 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_bias = Parameter(b2, requires_grad=False)
         torch.cuda.empty_cache()
 
+    # -- packed mode ---------------------------------------------------------
+
+    _EXL3_CB_IDS = {"default": 0, "mcg": 1, "mul1": 2}
+
+    @torch.no_grad()
+    def _process_packed(self, layer: torch.nn.Module) -> None:
+        """Keep per-expert trellis packs on GPU; no fp16 materialization."""
+        recs = layer._exl3_moe_records
+        E = layer.num_local_experts
+        dev = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        gated = self.moe_runner_config.is_gated if self.moe_runner_config else True
+
+        def get(e, prefix, shard, suffix):
+            lst = recs.get((e, prefix, shard, suffix))
+            return lst[0] if lst else None
+
+        def pack_matrix(e, prefix, shard):
+            trellis = get(e, prefix, shard, "trellis")
+            if trellis is None:
+                raise RuntimeError(
+                    "exl3 MoE packed mode requires every local expert to be "
+                    f"trellis-quantized (expert {e} {prefix}/{shard} is not)"
+                )
+            suh = get(e, prefix, shard, "suh")
+            svh = get(e, prefix, shard, "svh")
+            mul1 = get(e, prefix, shard, "mul1")
+            mcg = get(e, prefix, shard, "mcg")
+            codebook = _sentinel_to_codebook(mul1 if mul1 is not None else mcg)
+            if codebook == "default":
+                raise ValueError(
+                    "exl3 MoE packed: expert matrix without codebook marker"
+                )
+            bias = get(e, prefix, shard, "bias")
+            return (
+                trellis.to(dev),
+                suh.to(dev),
+                svh.to(dev),
+                bias.to(dev) if bias is not None else None,
+                self._EXL3_CB_IDS[codebook],
+            )
+
+        packed = {"gate": [], "up": [], "down": []}
+        for e in range(E):
+            packed["gate"].append(pack_matrix(e, "w13", "w1"))
+            if gated:
+                packed["up"].append(pack_matrix(e, "w13", "w3"))
+            packed["down"].append(pack_matrix(e, "w2", "w2"))
+            for k in [k for k in recs if k[0] == e]:
+                del recs[k]
+        layer._exl3_moe_records = {}
+        layer._exl3_moe_packed = packed
+        self._packed_state = packed
+        self._packed_gated = gated
+        torch.cuda.empty_cache()
+
+    def _exl3_gemm(self, x2, matrix, out_dt):
+        """One packed trellis GEMM, same numerics contract as the dense path."""
+        trellis, suh, svh, bias, cb = matrix
+        xh = torch.empty(x2.shape, dtype=torch.float16, device=x2.device)
+        torch.ops.sgl_kernel.sgl_exl3_had_in(x2, suh, xh)
+        out = torch.empty((x2.shape[0], svh.shape[0]), dtype=out_dt, device=x2.device)
+        torch.ops.sgl_kernel.sgl_exl3_linear(xh, trellis, svh, bias, cb, out)
+        return out
+
+    def run_packed_moe(self, dispatch_output, runner_config):
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardCombineInput,
+        )
+
+        packed = self._packed_state
+        hs = dispatch_output.hidden_states
+        topk = dispatch_output.topk_output
+        ids = topk.topk_ids
+        wts = topk.topk_weights
+        if runner_config.apply_router_weight_on_input:
+            raise NotImplementedError(
+                "exl3 MoE packed: apply_router_weight_on_input is not supported"
+            )
+        x = hs.reshape(-1, hs.shape[-1])
+        if x.dtype not in (torch.float16, torch.bfloat16):
+            x = x.to(torch.float16)
+        out_dt = x.dtype
+        E = len(packed["down"])
+        K = ids.shape[-1]
+        flat = ids.reshape(-1).to(torch.long)
+        # Sort (token, expert) pairs by expert; remote pairs (-1) trail at the
+        # sentinel E and are never touched.
+        key = torch.where(flat >= 0, flat, torch.full_like(flat, E))
+        order = torch.argsort(key, stable=True)
+        sids = key[order]
+        tok = order // K
+        pw = wts.reshape(-1)[order].float()
+        rsf = runner_config.routed_scaling_factor
+        if rsf is not None:
+            pw = pw * rsf
+        counts = torch.bincount(sids, minlength=E + 1)[:E]
+        counts_l = counts.cpu().tolist()
+        starts_l = [0]
+        for c in counts_l:
+            starts_l.append(starts_l[-1] + c)
+
+        out = torch.zeros(
+            (x.shape[0], packed["down"][0][2].shape[0]),
+            dtype=torch.float32,
+            device=x.device,
+        )
+        gated = self._packed_gated
+        act = runner_config.activation
+        for e in range(E):
+            s0, s1 = starts_l[e], starts_l[e + 1]
+            if s1 == s0:
+                continue
+            rows = tok[s0:s1]
+            x_e = x[rows]
+            o_g = self._exl3_gemm(x_e, packed["gate"][e], out_dt)
+            if gated:
+                o_u = self._exl3_gemm(x_e, packed["up"][e], out_dt)
+                if act == "silu":
+                    mid = F.silu(o_g.float()) * o_u.float()
+                elif act == "gelu":
+                    mid = F.gelu(o_g.float()) * o_u.float()
+                else:
+                    raise NotImplementedError(
+                        f"exl3 MoE packed: activation {act} not supported"
+                    )
+            else:
+                mid = F.silu(o_g.float()) if act == "silu" else F.gelu(o_g.float())
+            mid = mid.to(out_dt)
+            o_d = self._exl3_gemm(mid, packed["down"][e], out_dt)
+            out.index_add_(0, rows, o_d.float() * pw[s0:s1, None])
+        return StandardCombineInput(hidden_states=out.to(hs.dtype))
+
     # -- runner --------------------------------------------------------------
 
     def create_moe_runner(self, layer: torch.nn.Module, moe_runner_config):
@@ -830,10 +1008,17 @@ class ExL3MoEMethod(FusedMoEMethodBase):
 
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        if self.packed:
+            self.runner.fused_func = None
+            self.runner.runner_core = ExL3MoeRunnerCore(moe_runner_config, self)
 
     def get_triton_quant_info(self, layer: torch.nn.Module):
         from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 
+        if self.packed:
+            # Packed mode ignores quant info; the runner core reads the
+            # per-expert packs straight off the method.
+            return TritonMoeQuantInfo(w13_weight=None, w2_weight=None)
         return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
