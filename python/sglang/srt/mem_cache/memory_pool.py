@@ -56,7 +56,6 @@ from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
-from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
@@ -2983,84 +2982,6 @@ class MHATokenToKVPool(KVCache):
             )
 
         return dq_k, dq_v
-
-    def prepare_swa_dequant_workspace(
-        self,
-        layer_id: int,
-        req_to_token: torch.Tensor,
-        req_pool_indices_cpu,
-        seq_lens_cpu,
-        sliding_window_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Fill the b-side FP8 workspace from the SWA pool for one decode step.
-
-        Gathers the last min(seq_len, window) tokens per request, translates
-        full-pool slots to SWA slots, dequantizes FP4 -> FP8 into the b-side
-        workspace, and returns (page_table, kv_lens) for the SWA paged plan.
-        """
-        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
-        if not is_swa_layer:
-            raise RuntimeError(
-                "SWA dequant workspace prepare called for a full-attention layer."
-            )
-        dq_k, dq_v = self.get_dequant_workspace_b()
-        k_fp4, v_fp4, k_scales, v_scales = self.swa_kv_pool.get_raw_kv_buffer(
-            layer_id_pool
-        )
-
-        row = self.page_size  # reserved scratch row, matches the a-side layout
-        table_entries = []
-        kv_lens = []
-        for i in range(len(req_pool_indices_cpu)):
-            req_idx = int(req_pool_indices_cpu[i])
-            seq_len = int(seq_lens_cpu[i])
-            keep = min(seq_len, sliding_window_size)
-            start = seq_len - keep
-            locs = req_to_token[req_idx, start:seq_len]
-            locs = self.translate_loc_from_full_to_swa(locs)
-            valid = locs >= 0
-            safe = locs.clamp(min=0)
-            n = int(valid.sum().item())
-            dq_k[row : row + keep] = (
-                NVFP4KVQuantizeUtil.dequantize(
-                    k_fp4[safe].view(torch.uint8),
-                    k_scales[safe],
-                    self.swa_kv_pool.quant_method.k_scales_gpu[
-                        layer_id_pool : layer_id_pool + 1
-                    ],
-                )
-                .to(torch.float8_e4m3fn)
-            )
-            dq_v[row : row + keep] = (
-                NVFP4KVQuantizeUtil.dequantize(
-                    v_fp4[safe].view(torch.uint8),
-                    v_scales[safe],
-                    self.swa_kv_pool.quant_method.v_scales_gpu[
-                        layer_id_pool : layer_id_pool + 1
-                    ],
-                )
-                .to(torch.float8_e4m3fn)
-            )
-            # Invalidate rows whose SWA slot was evicted (-1): zero KV + zero
-            # scale -> zero contribution after dequant.
-            if not bool(valid.all().item()):
-                dq_k[row : row + keep] = torch.where(
-                    valid.unsqueeze(-1), dq_k[row : row + keep], torch.zeros_like(dq_k[row : row + keep])
-                )
-                dq_v[row : row + keep] = torch.where(
-                    valid.unsqueeze(-1), dq_v[row : row + keep], torch.zeros_like(dq_v[row : row + keep])
-                )
-            table_entries.append(
-                torch.arange(row, row + keep, dtype=torch.int32, device=dq_k.device)
-            )
-            kv_lens.append(keep)
-            row += keep
-
-        page_table = (
-            torch.cat(table_entries) if table_entries else torch.zeros(0, dtype=torch.int32, device=dq_k.device)
-        )
-        lens = torch.tensor(kv_lens, dtype=torch.int32, device=dq_k.device)
-        return page_table, lens
 
     def _prepare_dequant_decode_workspace(
         self,
