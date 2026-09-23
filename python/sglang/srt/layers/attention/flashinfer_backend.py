@@ -909,6 +909,7 @@ class FlashInferAttnBackend(AttentionBackend):
         """
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
+        self.dq_full_paged_kernel_lens = None
         self.cpu_req_pool_indices = None
         # Decode-as-extend for asymmetric K/V head dims over the FP8 dequant
         # workspace: FlashInfer's decode kernels hardcode head_dim_vo =
@@ -916,9 +917,16 @@ class FlashInferAttnBackend(AttentionBackend):
         # paged-prefill kernel with q_len=1 (correct; slightly slower than
         # the dedicated decode kernel).
         self.decode_as_extend = getattr(self, "decode_as_extend", False)
+        is_decode_as_extend_step = (
+            self.decode_as_extend
+            and forward_batch.forward_mode.is_decode_or_idle()
+        )
         if not (
             self.prefill_uses_dequant_workspace
-            and forward_batch.forward_mode.is_extend_without_speculative()
+            and (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                or is_decode_as_extend_step
+            )
         ):
             return
 
@@ -974,6 +982,10 @@ class FlashInferAttnBackend(AttentionBackend):
             dtype=torch.int32,
             device=device,
         )
+        # Stash the a-side lengths: the SWA wrapper swap below overwrites
+        # dq_paged_kernel_lens with the b-side (window-trimmed) lengths, and
+        # the full-attention wrapper needs the a-side ones back.
+        self.dq_full_paged_kernel_lens = self.dq_paged_kernel_lens
         self.cpu_req_pool_indices = forward_batch.req_pool_indices.to(
             "cpu", non_blocking=True
         )
@@ -1025,13 +1037,18 @@ class FlashInferAttnBackend(AttentionBackend):
             forward_batch.extend_prefix_lens_cpu = [
                 int(x) - 1 for x in seq_lens_cpu
             ]
-            # a-side: full-pool prefix dequant (existing helper).
+            # a-side: full-pool prefix dequant (existing helper). The paged
+            # side covers the cached prefix only (ragged handles the current
+            # token), so the workspace table is built from prefix lengths.
             self._prepare_dequant_workspace_metadata_for_extend(
-                forward_batch, False
+                forward_batch, True
             )
             # b-side: SWA-pool prefix dequant (translated + window-trimmed)
-            # for the hybrid SWA pool; single-pool setups skip it.
-            if self.token_to_kv_pool.__class__.__name__ == "SWAKVPool":
+            # for the hybrid SWA pool; single-pool or non-NVFP4 setups skip it.
+            if (
+                self.prefill_uses_dequant_workspace
+                and self.token_to_kv_pool.__class__.__name__ == "SWAKVPool"
+            ):
                 first_layer_id = (
                     self.layers[0].layer_id if hasattr(self, "layers") else 0
                 )
@@ -1055,6 +1072,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=None,
                 extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
+                custom_kv_indices=self.dq_page_table,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -2207,6 +2225,12 @@ class FlashInferIndicesUpdaterPrefill:
                 )
                 wrapper_custom = custom_kv_indices_swa
             else:
+                # Full-attention wrapper reads the a-side workspace; restore
+                # the a-side table/lengths the SWA branch may have swapped out.
+                self.attn_backend.dq_page_table = custom_kv_indices
+                self.attn_backend.dq_paged_kernel_lens = (
+                    self.attn_backend.dq_full_paged_kernel_lens
+                )
                 wrapper_custom = custom_kv_indices
             self.call_begin_forward(
                 self.prefill_wrapper_ragged,
