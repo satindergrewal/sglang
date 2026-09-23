@@ -258,6 +258,12 @@ class SWAKVPool(BaseSWAKVPool):
         else:
             return self.full_kv_pool.get_kv_scale_buffer(layer_id_pool)
 
+    def get_dequant_workspace_rows(self) -> int:
+        # The a-side (full-pool) workspace bounds decode-as-extend layouts:
+        # every live token occupies a full-pool slot, so pool capacity is the
+        # natural bound.
+        return self.full_kv_pool.get_dequant_workspace_rows()
+
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
         assert self.full_to_swa_index_mapping is not None
         # -1 in kv_indices maps to -1 via the sentinel appended to the mapping.

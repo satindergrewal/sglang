@@ -2803,6 +2803,12 @@ class MHATokenToKVPool(KVCache):
             )
         return self.dq_k_buffer_b, self.dq_v_buffer_b
 
+    def get_dequant_workspace_rows(self) -> int:
+        """Row capacity of the a-side FP8 dequant workspace."""
+        if self.dq_k_buffer is None:
+            return 0
+        return int(self.dq_k_buffer.shape[0])
+
     def get_flashinfer_dequant_workspace_kv_buffer(
         self,
         layer: RadixAttention,
