@@ -648,6 +648,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.replace_embeds is not None:
             return False
 
+        # Decode-as-extend (asymmetric-K/V NVFP4) builds per-step host-driven
+        # metadata — fresh gather plans and workspace tables whose pointers the
+        # captured kernels would bake in at capture time and read dangling at
+        # replay. Those batches always run eager.
+        if getattr(self.model_runner.attn_backend, "decode_as_extend", False):
+            return False
+
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
