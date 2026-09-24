@@ -148,8 +148,11 @@ PAGE_INDEX_ALIGNED_SIZE = 64
 
 @functools.lru_cache(maxsize=None)
 def _is_sm100_or_newer() -> bool:
-    # DeepGEMM's fp8_fp4 mqa-logits kernels need SM100+; Hopper takes the torch indexer.
-    return torch.cuda.get_device_capability()[0] >= 10
+    # DeepGEMM's fp8_fp4 mqa-logits kernels need SM100-class hardware; Hopper
+    # takes the torch indexer. SM120 (RTX PRO 6000, major 12) also falls back:
+    # deep_gemm's paged MQA metadata builder returns None there, so the
+    # DeepGEMM path would crash despite the capability check passing.
+    return torch.cuda.get_device_capability()[0] == 10
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
