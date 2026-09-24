@@ -200,22 +200,27 @@ def _slice_head_dim_v_proj(name: str, t: torch.Tensor, hf_config) -> torch.Tenso
         nkv = hf_config.num_key_value_heads
         hd = hf_config.head_dim
         vhd = getattr(hf_config, "v_head_dim", hd)
-    full = nkv * hd
+    if vhd >= hd:
+        return t
     want = nkv * vhd
-    if vhd >= hd or t.shape[-1] != full and t.shape[-1] != want:
-        return t
-    if t.shape[-1] == want:
-        return t
     if name.endswith(".trellis"):
         # (k16, n16, wb): n16 blocks are 16-wide; keep vhd/16 per head.
-        k16, n16, wb = t.shape
-        per_head = n16 // nkv
+        if t.ndim != 3 or t.shape[1] != nkv * (hd // 16):
+            return t
+        k16, _, wb = t.shape
+        per_head = hd // 16
         keep = vhd // 16
         return t.view(k16, nkv, per_head, wb)[:, :, :keep, :].reshape(k16, nkv * keep, wb)
     if name.endswith(".svh"):
-        return t.view(nkv, hd)[:, :vhd].reshape(want)
+        if t.ndim == 1 and t.shape[0] == nkv * hd:
+            return t.view(nkv, hd)[:, :vhd].reshape(want)
+        return t
     if name.endswith(".bias"):
-        return t.view(nkv, hd)[:, :vhd].reshape(want)
+        if t.ndim == 1 and t.shape[0] == nkv * hd:
+            return t.view(nkv, hd)[:, :vhd].reshape(want)
+        return t
+    if name.endswith(".weight") and t.ndim == 2 and t.shape[0] == want:
+        return t
     return t
 
 
