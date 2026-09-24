@@ -920,6 +920,10 @@ class FlashInferAttnBackend(AttentionBackend):
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
         self.dq_full_paged_kernel_lens = None
+        # A stale b-side table from an earlier decode step must never leak
+        # into a regular extend batch's SWA wrapper plan.
+        self.dq_swa_page_table = None
+        self.dq_swa_paged_kernel_lens = None
         self.cpu_req_pool_indices = None
         # Decode-as-extend for asymmetric K/V head dims over the FP8 dequant
         # workspace: FlashInfer's decode kernels hardcode head_dim_vo =
@@ -1461,6 +1465,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # from the SWA pool during metadata prep; no re-preparation).
             layer_is_swa = (
                 getattr(self, "decode_as_extend", False)
+                and forward_batch.forward_mode.is_decode_or_idle()
                 and layer.sliding_window_size is not None
                 and layer.sliding_window_size != -1
             )
@@ -2339,7 +2344,9 @@ class FlashInferIndicesUpdaterPrefill:
             )
         custom_kv_indices_swa = (
             self.attn_backend.dq_swa_page_table
-            if custom_kv_indices is not None and self.attn_backend.decode_as_extend
+            if custom_kv_indices is not None
+            and self.attn_backend.decode_as_extend
+            and self.attn_backend.dq_swa_page_table is not None
             else None
         )
         if prefix_lens is None:
