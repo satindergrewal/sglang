@@ -379,6 +379,7 @@ class ServerArgs:
         "MuseGlimmerForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
         "Cosmos3EdgeForConditionalGeneration",
+        "Glm5NextForConditionalGeneration",
         # MiMoV2 declares multimodal towers but serves text-only fine; the
         # MiMo mm processor import needs ffmpeg/torchcodec which text-only
         # deployments should not require.
