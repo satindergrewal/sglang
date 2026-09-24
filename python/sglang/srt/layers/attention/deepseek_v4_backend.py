@@ -1168,10 +1168,18 @@ class DeepseekV4AttnBackend(
         # Two-level low-ratio indexer (dsv4/candidate_indexer.py).
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
-        self.candidate_indexer = make_candidate_indexer(
-            getattr(cfg, "candidate_topk_blocks", 0),
-            getattr(cfg, "candidate_block_size", 0),
-        )
+        # The candidate indexer only serves candidate-source layers; without
+        # one (candidate_source_layer_id < 0, e.g. trimmed checkpoints) there
+        # is nothing to build and the DeepGEMM sparse-logits requirement does
+        # not apply.
+        self.candidate_indexer = None
+        if getattr(cfg, "candidate_source_layer_id", -1) is not None and (
+            getattr(cfg, "candidate_source_layer_id", -1) >= 0
+        ):
+            self.candidate_indexer = make_candidate_indexer(
+                getattr(cfg, "candidate_topk_blocks", 0),
+                getattr(cfg, "candidate_block_size", 0),
+            )
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
