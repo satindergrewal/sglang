@@ -1687,10 +1687,14 @@ class FlashInferAttnBackend(AttentionBackend):
             return
         if str(layer.layer_id) not in targets.split(","):
             return
-        step = getattr(self, "_nvfp4_dbg_step", 0)
-        self._nvfp4_dbg_step = step + 1
-        if step > 0:
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is None or int(seq_lens_cpu[0]) <= 1:
+            return  # warmup/graph dummies use seq_len=1; skip them
+        steps = getattr(self, "_nvfp4_dbg_steps", {})
+        if steps.get(layer.layer_id, 0) > 0:
             return
+        steps[layer.layer_id] = 1
+        self._nvfp4_dbg_steps = steps
         out_dir = "/tmp/nvfp4_dbg"
         os.makedirs(out_dir, exist_ok=True)
         pool = self.token_to_kv_pool
