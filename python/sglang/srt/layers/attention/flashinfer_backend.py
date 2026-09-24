@@ -1704,10 +1704,11 @@ class FlashInferAttnBackend(AttentionBackend):
         if seq_lens_cpu is None or int(seq_lens_cpu[0]) <= 1:
             return  # warmup/graph dummies use seq_len=1; skip them
         steps = getattr(self, "_nvfp4_dbg_steps", {})
-        if steps.get(layer.layer_id, 0) > 0:
+        if steps.get(layer.layer_id, 0) >= 12:
             return
-        steps[layer.layer_id] = 1
+        steps[layer.layer_id] = steps.get(layer.layer_id, 0) + 1
         self._nvfp4_dbg_steps = steps
+        step_idx = steps[layer.layer_id] - 1
         out_dir = "/tmp/nvfp4_dbg"
         os.makedirs(out_dir, exist_ok=True)
         bs = q.shape[0]
@@ -1821,8 +1822,12 @@ class FlashInferAttnBackend(AttentionBackend):
         except Exception as exc:  # pragma: no cover
             dump["manual_error"] = repr(exc)
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        torch.save(dump, f"{out_dir}/layer{layer.layer_id}_r{rank}.pt")
-        logger.warning("nvfp4 debug dump: layer %s written", layer.layer_id)
+        torch.save(
+            dump, f"{out_dir}/layer{layer.layer_id}_r{rank}_s{step_idx}.pt"
+        )
+        logger.warning(
+            "nvfp4 debug dump: layer %s step %s", layer.layer_id, step_idx
+        )
 
     @staticmethod
     def _apply_attention_sinks(o, lse, sinks, forward_batch):
