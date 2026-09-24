@@ -1771,9 +1771,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=q.device,
             )
-            w2 = BatchPrefillWithPagedKVCacheWrapper(
-                ws, "NHD", backend="fa2", indent_size=0
-            )
+            w2 = BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", backend="fa2")
             bs2 = bs
             qo_ip = torch.arange(0, bs2 + 1, dtype=torch.int32, device=q.device)
             kv_ip = torch.tensor(
