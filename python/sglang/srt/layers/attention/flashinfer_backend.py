@@ -1697,10 +1697,24 @@ class FlashInferAttnBackend(AttentionBackend):
         self._nvfp4_dbg_steps = steps
         out_dir = "/tmp/nvfp4_dbg"
         os.makedirs(out_dir, exist_ok=True)
+        bs = q.shape[0]
         pool = self.token_to_kv_pool
         req_to_token = self.req_to_token_pool.req_to_token
         dump = {
             "layer_id": layer.layer_id,
+            "sm_scale": layer.scaling,
+            "logit_cap": layer.logit_cap,
+            "k_scale_float": layer.k_scale_float,
+            "v_scale_float": layer.v_scale_float,
+            "qo_indptr_buf": paged_wrapper._qo_indptr_buf.cpu(),
+            "last_page_len_buf": paged_wrapper._paged_kv_last_page_len_buf.cpu(),
+            "plan_info": getattr(paged_wrapper, "_plan_info", None),
+            "cached_module": str(getattr(paged_wrapper, "_cached_module", None))[:200],
+            "kv_indptr_arg": getattr(self, "kv_indptr", None)[
+                self._get_wrapper_idx(layer)
+            ].cpu()
+            if getattr(self, "kv_indptr", None) is not None
+            else None,
             "is_swa": layer.sliding_window_size is not None
             and layer.sliding_window_size != -1,
             "sliding_window": layer.sliding_window_size,
@@ -1747,6 +1761,54 @@ class FlashInferAttnBackend(AttentionBackend):
             dump["global_scale_v"] = float(gs_v)
         except Exception as exc:  # pragma: no cover
             dump["raw_error"] = repr(exc)
+        # Manual re-run on a FRESH wrapper with the same visible inputs: isolates
+        # wrapper-internal state from the call contract.
+        try:
+            from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
+
+            ws = torch.empty(
+                max(int(dump["paged_kv_indptr"][bs].item()) + 64, 256),
+                dtype=torch.int32,
+                device=q.device,
+            )
+            w2 = BatchPrefillWithPagedKVCacheWrapper(
+                ws, "NHD", backend="fa2", indent_size=0
+            )
+            bs2 = bs
+            qo_ip = torch.arange(0, bs2 + 1, dtype=torch.int32, device=q.device)
+            kv_ip = torch.tensor(
+                dump["paged_kv_indptr"][: bs2 + 1].tolist(), dtype=torch.int32, device=q.device
+            )
+            kvidx = dump["paged_kv_indices"][: int(kv_ip[-1])].to(torch.int32).cuda()
+            lpl = torch.ones(bs2, dtype=torch.int32, device=q.device)
+            import flashinfer
+
+            w2.plan(
+                qo_ip,
+                kv_ip,
+                kvidx,
+                lpl,
+                32,
+                kv_cache[0].shape[1],
+                192,
+                1,
+                head_dim_vo=128,
+                q_data_type=q.dtype,
+                kv_data_type=torch.float8_e4m3fn,
+                causal=False,
+            )
+            o2m, s2m = w2.forward_return_lse(
+                q.view(-1, 32, 192).to(torch.bfloat16),
+                (kv_cache[0], kv_cache[1]),
+                causal=False,
+                sm_scale=layer.scaling,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+            dump["o2_manual"] = o2m.detach().cpu()
+            dump["s2_manual"] = s2m.detach().cpu()
+        except Exception as exc:  # pragma: no cover
+            dump["manual_error"] = repr(exc)
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         torch.save(dump, f"{out_dir}/layer{layer.layer_id}_r{rank}.pt")
         logger.warning("nvfp4 debug dump: layer %s written", layer.layer_id)
