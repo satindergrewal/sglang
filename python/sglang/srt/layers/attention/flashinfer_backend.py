@@ -1696,15 +1696,13 @@ class FlashInferAttnBackend(AttentionBackend):
         targets = os.environ.get("SGLANG_NVFP4_DEBUG_LAYERS", "")
         if not targets or not getattr(self, "decode_as_extend", False):
             return
-        if not forward_batch.forward_mode.is_decode_or_idle():
-            return
         if str(layer.layer_id) not in targets.split(","):
             return
         seq_lens_cpu = forward_batch.seq_lens_cpu
         if seq_lens_cpu is None or int(seq_lens_cpu[0]) <= 1:
             return  # warmup/graph dummies use seq_len=1; skip them
         steps = getattr(self, "_nvfp4_dbg_steps", {})
-        if steps.get(layer.layer_id, 0) >= 12:
+        if steps.get(layer.layer_id, 0) >= 40:
             return
         steps[layer.layer_id] = steps.get(layer.layer_id, 0) + 1
         self._nvfp4_dbg_steps = steps
@@ -1716,6 +1714,7 @@ class FlashInferAttnBackend(AttentionBackend):
         req_to_token = self.req_to_token_pool.req_to_token
         dump = {
             "layer_id": layer.layer_id,
+            "mode": str(forward_batch.forward_mode),
             "sm_scale": layer.scaling,
             "logit_cap": layer.logit_cap,
             "k_scale_float": layer.k_scale_float,
