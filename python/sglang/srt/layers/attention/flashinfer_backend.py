@@ -1619,12 +1619,20 @@ class FlashInferAttnBackend(AttentionBackend):
                     window_left=swa_window_left,
                     logits_soft_cap=logits_soft_cap,
                 )
+                # The paged plan is built with window_left=-1 on the ragged
+                # path (the SWA trim is physical in the updater / b-side
+                # table); re-passing a window at run time diverges from the
+                # planned module and corrupts the kernel. Keep them equal.
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     kv_cache,
                     causal=False,
                     sm_scale=layer.scaling,
-                    window_left=swa_window_left,
+                    window_left=(
+                        swa_window_left
+                        if not self.forward_metadata.use_ragged
+                        else -1
+                    ),
                     logits_soft_cap=logits_soft_cap,
                     # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
                     k_scale=layer.k_scale_float,
