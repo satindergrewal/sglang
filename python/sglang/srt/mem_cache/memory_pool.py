@@ -2837,16 +2837,8 @@ class MHATokenToKVPool(KVCache):
 
         if prepare_workspace:
             transfer_cur_kv = not use_ragged
-            k_cur_fp8 = (
-                k_cur.to(torch.float8_e4m3fn)
-                if k_cur is not None and transfer_cur_kv
-                else None
-            )
-            v_cur_fp8 = (
-                v_cur.to(torch.float8_e4m3fn)
-                if v_cur is not None and transfer_cur_kv
-                else None
-            )
+            k_cur_w = k_cur if (k_cur is not None and transfer_cur_kv) else None
+            v_cur_w = v_cur if (v_cur is not None and transfer_cur_kv) else None
             self._prepare_dequant_extend_workspace(
                 layer.layer_id if layer_id_override is None else layer_id_override,
                 layer.layer_id,
@@ -2855,8 +2847,8 @@ class MHATokenToKVPool(KVCache):
                 extend_prefix_lens_cpu,
                 extend_seq_lens_cpu,
                 page_size,
-                k_cur_fp8=k_cur_fp8,
-                v_cur_fp8=v_cur_fp8,
+                k_cur_fp8=k_cur_w,
+                v_cur_fp8=v_cur_w,
             )
 
         k_buffer_dq, v_buffer_dq = self.get_dequant_workspace()
