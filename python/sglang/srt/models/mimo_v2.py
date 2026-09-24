@@ -180,6 +180,45 @@ def _get_ckpt_qkv_shard_sizes(config, layer_name, ckpt_tp):
     return (q_per_shard, k_per_shard, v_per_shard)
 
 
+def _slice_head_dim_v_proj(name: str, t: torch.Tensor, hf_config) -> torch.Tensor:
+    """MiMo-V2 checkpoints store v_proj at nkv*head_dim columns; the model
+    consumes nkv*v_head_dim (the HF arch slices V per head at runtime). EXL3
+    checkpoints ship v_proj quantized at that head_dim width, so slice each
+    kv head's block down to v_head_dim before the fused-qkv load."""
+    if ".v_proj." not in name:
+        return t
+    pattern = getattr(hf_config, "hybrid_layer_pattern", None)
+    m = re.search(r"layers\.(\d+)\.", name)
+    if pattern is None or m is None:
+        return t
+    layer_id = int(m.group(1))
+    if pattern[layer_id] == 1:
+        nkv = hf_config.swa_num_key_value_heads
+        hd = hf_config.swa_head_dim
+        vhd = getattr(hf_config, "swa_v_head_dim", hd)
+    else:
+        nkv = hf_config.num_key_value_heads
+        hd = hf_config.head_dim
+        vhd = getattr(hf_config, "v_head_dim", hd)
+    full = nkv * hd
+    want = nkv * vhd
+    if vhd >= hd or t.shape[-1] != full and t.shape[-1] != want:
+        return t
+    if t.shape[-1] == want:
+        return t
+    if name.endswith(".trellis"):
+        # (k16, n16, wb): n16 blocks are 16-wide; keep vhd/16 per head.
+        k16, n16, wb = t.shape
+        per_head = n16 // nkv
+        keep = vhd // 16
+        return t.view(k16, nkv, per_head, wb)[:, :, :keep, :].reshape(k16, nkv * keep, wb)
+    if name.endswith(".svh"):
+        return t.view(nkv, hd)[:, :vhd].reshape(want)
+    if name.endswith(".bias"):
+        return t.view(nkv, hd)[:, :vhd].reshape(want)
+    return t
+
+
 def _deinterleave_qkv_shards(shards, q_per_shard, k_per_shard, v_per_shard):
     all_q, all_k, all_v = [], [], []
     for s in shards:
@@ -1492,6 +1531,8 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
 
             if not self._is_multimodal and (is_vision_weight or is_audio_weight):
                 continue
+
+            loaded_weight = _slice_head_dim_v_proj(name, loaded_weight, self.config)
 
             if self.config.encoder_only and name.startswith(
                 self._LANGUAGE_WEIGHT_PREFIXES
