@@ -537,9 +537,14 @@ class ExL3LinearMethod(LinearMethodBase):
 
             tp = get_parallel().tp_size
             lw = loaded_weight
-            if tp > 1 and lw.shape[-1] == in_size * tp and in_size != lw.shape[-1]:
-                rank = get_parallel().tp_rank
-                lw = lw[:, rank * in_size : (rank + 1) * in_size]
+            rank = get_parallel().tp_rank
+            if tp > 1:
+                idx0 = _shard_first_index(shard_id)
+                shard_out_pr = output_partition_sizes[idx0]
+                if lw.shape[-1] == in_size * tp and in_size != lw.shape[-1]:
+                    lw = lw[:, rank * in_size : (rank + 1) * in_size]
+                if lw.shape[0] == shard_out_pr * tp and shard_out_pr != lw.shape[0]:
+                    lw = lw[rank * shard_out_pr : (rank + 1) * shard_out_pr]
             layer._exl3_plain.setdefault(shard_id, []).append(lw)
             w = layer.weight
             if w.numel() == 0:
