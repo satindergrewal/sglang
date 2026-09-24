@@ -765,7 +765,10 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         v_bf16 = NVFP4KVQuantizeUtil.dequantize(
             v_fp4.view(torch.uint8), v_scales, cur_v_scale
         )
-        return k_bf16.to(torch.float8_e4m3fn), v_bf16.to(torch.float8_e4m3fn)
+        # BF16 workspace: FlashInfer's fa2 paged-prefill kernel produces
+        # nondeterministic garbage for fp8 KV on SM120 with this geometry
+        # (asymmetric 192K/128V, page_size 1), while bf16 KV is exact.
+        return k_bf16, v_bf16
 
     def compute_cell_size(
         self, head_num: int, head_dim: int, num_layers: int, kv_size: int
@@ -950,6 +953,7 @@ _ANY_BACKEND = KVCacheBackendMatcher(any_backend=True)
 _NVFP4_SCALE = "nvfp4"
 _FP4_MX_SCALE = "fp4_mx_block16"
 _FP8_E4M3 = torch.float8_e4m3fn
+_ATTN_BF16 = torch.bfloat16
 _TORCH_FP4 = getattr(torch, "float4_e2m1fn_x2", None)
 _BF16 = torch.bfloat16
 _NVFP4_DQ_KV_PREFILL_BACKENDS = frozenset({"flashinfer"})
@@ -1027,13 +1031,13 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
         _plain(_DECODE, _CPU_FP8_BACKENDS),
     ),
     NVFP4KVCacheMethod.name: (
-        _dq_workspace(_PREFILL, _NVFP4_DQ_KV_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3),
+        _dq_workspace(_PREFILL, _NVFP4_DQ_KV_PREFILL_BACKENDS, _NVFP4_SCALE, _ATTN_BF16),
         _native_fp4(_PREFILL, _NVFP4_KV_PREFILL_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
         _native_fp4(_DECODE, _NVFP4_KV_DECODE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
         # FlashInfer decode over the FP8 dequant workspace: the escape hatch
         # for asymmetric K/V head dims (MiMo-V2.6 192K/128V) whose native
         # XQA decode kernel assumes symmetric packed widths.
-        _dq_workspace(_DECODE, "flashinfer", _NVFP4_SCALE, _FP8_E4M3),
+        _dq_workspace(_DECODE, "flashinfer", _NVFP4_SCALE, _ATTN_BF16),
     ),
     FP4MXBlock16KVCacheMethod.name: (
         _plain(_PREFILL, _FP4_MX_PREFILL_BACKENDS, _FP4_MX_SCALE, _BF16),

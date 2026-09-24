@@ -361,7 +361,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.cpu_req_pool_indices = None
         # FP4 fake-quant prefill/decode exposes an FP8 workspace to FlashInfer.
         self.flashinfer_kv_cache_dtype = (
-            torch.float8_e4m3fn
+            torch.bfloat16
             if (
                 self.prefill_uses_dequant_workspace
                 or self.decode_uses_dequant_workspace
