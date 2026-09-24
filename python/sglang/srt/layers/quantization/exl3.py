@@ -453,6 +453,7 @@ class ExL3LinearMethod(LinearMethodBase):
         **extra_weight_attrs,
     ):
         layer._exl3_output_sizes = list(output_partition_sizes)
+        layer._exl3_in_pr = input_size_per_partition
         layer._exl3_records = {}
         layer._exl3_plain = {}
         for suffix in _EXL3_PARAMS:
@@ -477,27 +478,80 @@ class ExL3LinearMethod(LinearMethodBase):
     @staticmethod
     def _make_loader(layer: torch.nn.Module, suffix: str):
         def loader(param, loaded_weight, shard_id=None):
+            loaded_weight = ExL3LinearMethod._tp_slice_dense(
+                layer, suffix, shard_id, loaded_weight
+            )
             rec = layer._exl3_records.setdefault(suffix, {})
             rec.setdefault(shard_id, []).append(loaded_weight)
 
         return loader
 
     @staticmethod
+    def _tp_slice_dense(layer: torch.nn.Module, suffix: str, shard_id, t):
+        """Slice a dense checkpoint tensor to this TP rank's shard.
+
+        Dense EXL3 was first exercised at tp=1; at tp>1 the checkpoint holds
+        full matrices while the module owns one partition. Column-parallel
+        shards slice N (trellis n16 / svh / bias), row-parallel shards slice
+        K (trellis k16 / suh). The split direction follows the shapes: a dim
+        equal to tp x the per-rank size is the sharded one.
+        """
+        from sglang.srt.runtime_context import get_parallel
+
+        tp = get_parallel().tp_size
+        if tp <= 1:
+            return t
+        rank = get_parallel().tp_rank
+        outs = layer._exl3_output_sizes
+        idx = _shard_first_index(shard_id)
+        n_cov = len(shard_id) if isinstance(shard_id, tuple) else 1
+        out_pr = sum(outs[idx : idx + n_cov])
+
+        if suffix in ("svh", "bias"):
+            n_full = t.shape[0]
+            if n_full != out_pr and n_full == out_pr * tp:
+                return t[rank * out_pr : (rank + 1) * out_pr]
+            return t
+        if suffix == "suh":
+            k_full = t.shape[0]
+            in_pr = layer._exl3_in_pr * n_cov
+            if k_full != in_pr and k_full == in_pr * tp:
+                return t[rank * in_pr : (rank + 1) * in_pr]
+            return t
+        if suffix == "trellis":
+            k16, n16 = t.shape[0], t.shape[1]
+            n16_pr = out_pr // 16
+            if n16 != n16_pr and n16 == n16_pr * tp:
+                t = t[:, rank * n16_pr : (rank + 1) * n16_pr, :]
+            in16_pr = layer._exl3_in_pr // 16
+            if k16 != in16_pr and k16 == in16_pr * tp:
+                t = t[rank * in16_pr : (rank + 1) * in16_pr, :, :]
+            return t
+        return t
+
+    @staticmethod
     def _make_plain_loader(layer: torch.nn.Module, out_total: int, in_size: int,
                            output_partition_sizes: List[int]):
         def loader(param, loaded_weight, shard_id=None):
-            layer._exl3_plain.setdefault(shard_id, []).append(loaded_weight)
+            from sglang.srt.runtime_context import get_parallel
+
+            tp = get_parallel().tp_size
+            lw = loaded_weight
+            if tp > 1 and lw.shape[-1] == in_size * tp and in_size != lw.shape[-1]:
+                rank = get_parallel().tp_rank
+                lw = lw[:, rank * in_size : (rank + 1) * in_size]
+            layer._exl3_plain.setdefault(shard_id, []).append(lw)
             w = layer.weight
             if w.numel() == 0:
                 w = Parameter(
-                    torch.empty(out_total, in_size, dtype=loaded_weight.dtype,
+                    torch.empty(out_total, in_size, dtype=lw.dtype,
                                 device="cuda"),
                     requires_grad=False,
                 )
                 layer.weight = w
             idx = _shard_first_index(shard_id)
             off = sum(output_partition_sizes[:idx])
-            w.data[off:off + loaded_weight.shape[0]].copy_(loaded_weight)
+            w.data[off:off + lw.shape[0]].copy_(lw)
 
         return loader
 
