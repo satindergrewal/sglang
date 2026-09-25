@@ -48,7 +48,7 @@ class TensorDumper:
 
     def add_tensor(self, name, tensor_item):
         if isinstance(tensor_item, (tuple, list)):
-            tensors = [t.cpu() for t in tensor_item if t is not None]
+            tensors = [t.cpu() for t in tensor_item if isinstance(t, torch.Tensor)]
             if len(tensors) == 1:
                 self._current_tensors[name] = tensors[0]
             else:
