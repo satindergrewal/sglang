@@ -1924,7 +1924,15 @@ class FlashInferAttnBackend(AttentionBackend):
             v_scale=layer.v_scale_float,
         )
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        # Asymmetric head dims (v_head_dim < head_dim, e.g. MiMo-V2): the
+        # decode GEMM writes v_head_dim-wide rows, so the output view must
+        # follow v_head_dim, not head_dim.
+        out_head_dim = (
+            layer.v_head_dim
+            if layer.qk_head_dim != layer.v_head_dim
+            else layer.head_dim
+        )
+        return o.view(-1, layer.tp_q_head_num * out_head_dim)
 
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:
