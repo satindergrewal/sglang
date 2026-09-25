@@ -402,7 +402,17 @@ __global__ void exl3_gemm_kernel_v2(
     // Hadamard/svh/bias epilogue inline — removes the separate reduce
     // launch (400/step at decode). The counter resets to 0 so CUDA-graph
     // replays see the initial state.
+    //
+    // Ordering: the partial stores above are made by ALL warps of the block,
+    // so the block must barrier before thread 0 publishes its arrival —
+    // otherwise the last-arriving block can reduce this block's workspace
+    // rows before sibling warps have issued their stores (observed as
+    // nondeterministic garbage columns under allocator churn). Thread 0's
+    // __threadfence() then publishes the whole block's stores device-wide
+    // (fence cumulativity over the __syncthreads edge), and the readers
+    // fence before touching other blocks' rows.
     __shared__ bool s_is_last;
+    __syncthreads();
     if (threadIdx.x == 0)
     {
         __threadfence();
@@ -411,6 +421,7 @@ __global__ void exl3_gemm_kernel_v2(
     }
     __syncthreads();
     if (!s_is_last) return;  // whole block exits together
+    __threadfence();
 
     // Block-wide reduce + epilogue over the 16 rows this block covers (m<=16):
     // 8 warps x 2 rows, matching the reduce kernel's assignment.

@@ -181,10 +181,12 @@ def _get_ckpt_qkv_shard_sizes(config, layer_name, ckpt_tp):
 
 
 def _slice_head_dim_v_proj(name: str, t: torch.Tensor, hf_config) -> torch.Tensor:
-    """MiMo-V2 checkpoints store v_proj at nkv*head_dim columns; the model
-    consumes nkv*v_head_dim (the HF arch slices V per head at runtime). EXL3
-    checkpoints ship v_proj quantized at that head_dim width, so slice each
-    kv head's block down to v_head_dim before the fused-qkv load."""
+    """MiMo-V2 checkpoints may store v_proj at nkv*head_dim columns (V padded
+    with zero lanes up to head_dim); the model consumes nkv*v_head_dim. Only a
+    plain 2-D matrix may be sliced here: slicing must happen AFTER the output
+    Hadamard, and head_dim (192) straddles the 128-column Hadamard blocks, so
+    trellis/svh/bias tensors of EXL3 checkpoints are loaded full-width and the
+    zero lanes are dropped post-GEMM instead (see MiMoV2Attention)."""
     if ".v_proj." not in name:
         return t
     pattern = getattr(hf_config, "hybrid_layer_pattern", None)
@@ -203,24 +205,8 @@ def _slice_head_dim_v_proj(name: str, t: torch.Tensor, hf_config) -> torch.Tenso
     if vhd >= hd:
         return t
     want = nkv * vhd
-    if name.endswith(".trellis"):
-        # (k16, n16, wb): n16 blocks are 16-wide; keep vhd/16 per head.
-        if t.ndim != 3 or t.shape[1] != nkv * (hd // 16):
-            return t
-        k16, _, wb = t.shape
-        per_head = hd // 16
-        keep = vhd // 16
-        return t.view(k16, nkv, per_head, wb)[:, :, :keep, :].reshape(k16, nkv * keep, wb)
-    if name.endswith(".svh"):
-        if t.ndim == 1 and t.shape[0] == nkv * hd:
-            return t.view(nkv, hd)[:, :vhd].reshape(want)
-        return t
-    if name.endswith(".bias"):
-        if t.ndim == 1 and t.shape[0] == nkv * hd:
-            return t.view(nkv, hd)[:, :vhd].reshape(want)
-        return t
-    if name.endswith(".weight") and t.ndim == 2 and t.shape[0] == want:
-        return t
+    if name.endswith(".weight") and t.ndim == 2 and t.shape[0] == nkv * hd:
+        return t.view(nkv, hd, t.shape[1])[:, :vhd, :].reshape(want, t.shape[1])
     return t
 
 
@@ -687,6 +673,21 @@ class MiMoV2Attention(nn.Module):
         self.k_size = self.num_kv_heads * self.head_dim
         self.v_size = self.num_kv_heads * self.v_head_dim
 
+        # EXL3 checkpoints quantize v_proj at head_dim width (HF stores V padded
+        # with zero lanes up to head_dim). head_dim=192 straddles the 128-column
+        # Hadamard blocks of the trellis format, so the packed tensors cannot be
+        # sliced per head at load; the fused GEMM stays full-width and the zero
+        # lanes are dropped right after it. Plain checkpoints already store v at
+        # nkv*v_head_dim and need none of this.
+        self.v_ckpt_full = (
+            quant_config is not None
+            and quant_config.get_name() == "exl3"
+            and self.v_head_dim != self.head_dim
+        )
+        self.v_ckpt_size = (
+            self.num_kv_heads * self.head_dim if self.v_ckpt_full else self.v_size
+        )
+
         self.v_scale = v_scale
 
         self.scaling = self.head_dim**-0.5
@@ -696,7 +697,7 @@ class MiMoV2Attention(nn.Module):
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            v_head_size=self.v_head_dim,
+            v_head_size=self.head_dim if self.v_ckpt_full else self.v_head_dim,
             bias=attention_bias,
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
@@ -764,7 +765,10 @@ class MiMoV2Attention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        q, k, v = qkv.split([self.q_size, self.k_size, self.v_ckpt_size], dim=-1)
+        if self.v_ckpt_full:
+            v = v.reshape(*v.shape[:-1], self.num_kv_heads, self.head_dim)
+            v = v[..., : self.v_head_dim].reshape(*v.shape[:-2], self.v_size)
 
         q, k = self.rotary_emb(positions, q, k)
         if self.v_scale is not None:
@@ -791,7 +795,10 @@ class MiMoV2Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        q, k, v = qkv.split([self.q_size, self.k_size, self.v_ckpt_size], dim=-1)
+        if self.v_ckpt_full:
+            v = v.reshape(*v.shape[:-1], self.num_kv_heads, self.head_dim)
+            v = v[..., : self.v_head_dim].reshape(*v.shape[:-2], self.v_size)
 
         # [t, h, dr]
         q, k = self.rotary_emb(positions, q, k)

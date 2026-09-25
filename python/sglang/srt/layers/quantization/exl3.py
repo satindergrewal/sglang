@@ -57,6 +57,32 @@ from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
 
+# Optional runtime override for the EXL3 CUDA ops (sgl_exl3_had_in /
+# sgl_exl3_linear). When SGLANG_EXL3_PATCH_SO (default
+# /work/exl3_patch/exl3_patch.so) exists, it is loaded after sgl_kernel so its
+# TORCH_LIBRARY_IMPL registrations replace the shipped kernels — lets a patched
+# kernel ship without rebuilding the whole AOT extension. No-op when absent.
+_EXL3_PATCH_STATE = {"loaded": False}
+
+
+def _load_exl3_patch_so() -> None:
+    if _EXL3_PATCH_STATE["loaded"]:
+        return
+    _EXL3_PATCH_STATE["loaded"] = True
+    so = os.environ.get("SGLANG_EXL3_PATCH_SO", "/work/exl3_patch/exl3_patch.so")
+    if not os.path.exists(so):
+        return
+    try:
+        import sgl_kernel  # noqa: F401 — registers the op schemas first
+
+        torch.ops.load_library(so)
+        logger.info("exl3: loaded kernel override patch %s", so)
+    except Exception as e:
+        logger.warning("exl3: kernel override patch %s failed to load: %s", so, e)
+
+
+_load_exl3_patch_so()
+
 _is_cuda = is_cuda()
 
 # ---------------------------------------------------------------------------
