@@ -56,7 +56,8 @@ class TensorDumper:
         elif isinstance(tensor_item, torch.Tensor):
             self._current_tensors[name] = tensor_item.cpu()
         elif isinstance(tensor_item, LogitsProcessorOutput):
-            self._current_tensors[name] = tensor_item.next_token_logits.cpu()
+            if tensor_item.next_token_logits is not None:
+                self._current_tensors[name] = tensor_item.next_token_logits.cpu()
         elif isinstance(tensor_item, ForwardBatch):
             self._current_tensors[name + ".forward_batch_info.input_ids"] = (
                 tensor_item.input_ids.cpu()
