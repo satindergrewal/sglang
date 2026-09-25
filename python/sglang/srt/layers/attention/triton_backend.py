@@ -2531,4 +2531,15 @@ def update_sliding_window_buffer(
                 window_kv_indices[:kv_last_index]
             )
         )
+    import os as _os
+    if _os.environ.get("SGLANG_DEBUG_SWA_META") == "1":
+        m = getattr(token_to_kv_pool, "full_to_swa_index_mapping", None)
+        mstat = None
+        if m is not None:
+            mstat = f"mapping size={m.numel()} nonzero={(m > 0).sum().item()}"
+        logger.info(
+            f"[swameta] translated={translated} bs={bs} lens={window_kv_lens[:4].tolist()} "
+            f"indptr={window_kv_indptr[:5].tolist()} idx[:8]={window_kv_indices[:8].tolist()} "
+            f"mapping={mstat}"
+        )
     return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx
