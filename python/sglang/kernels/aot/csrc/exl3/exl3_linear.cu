@@ -285,7 +285,7 @@ namespace exl3 {
 // window-word loads before the decode chain, and stages fp32 partials in a
 // workspace. A separate reduce kernel sums the k-splits in fixed order
 // (deterministic) and applies the identical fused epilogue.
-template <int BITS, int BM>
+template <int BITS, int BM, bool HALF_K = false>
 __global__ void exl3_gemm_kernel_v2(
     const half* __restrict__ g_x,
     const uint16_t* __restrict__ g_packed,
@@ -295,7 +295,7 @@ __global__ void exl3_gemm_kernel_v2(
     const half* __restrict__ g_svh, const half* __restrict__ g_bias,
     half* __restrict__ g_out, int bf16_out)
 {
-    constexpr int words16 = BITS * 16;
+    constexpr int words16 = BITS * 16 + (HALF_K ? 8 : 0);
     const int t = threadIdx.x;
     const int lane = t & 31;
     const int warp = t >> 5;
@@ -317,17 +317,20 @@ __global__ void exl3_gemm_kernel_v2(
 
     constexpr int n_words = BITS * 256 / 32;
     int wp0[8], wp1[8], ws0[8];
-#pragma unroll
-    for (int j = 0; j < 8; j++)
+    if constexpr (!HALF_K)
     {
-        const int e = lane * 8 + j;
-        const int b0 = e * BITS + BITS - 16 + 256 * BITS;
-        const int b1 = b0 + 16;
-        const int i0 = b0 / 32;
-        const int i1 = (b1 - 1) / 32;
-        wp0[j] = i0 % n_words;
-        wp1[j] = i1 % n_words;
-        ws0[j] = (i1 + 1) * 32 - b1;
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+        {
+            const int e = lane * 8 + j;
+            const int b0 = e * BITS + BITS - 16 + 256 * BITS;
+            const int b1 = b0 + 16;
+            const int i0 = b0 / 32;
+            const int i1 = (b1 - 1) / 32;
+            wp0[j] = i0 % n_words;
+            wp1[j] = i1 % n_words;
+            ws0[j] = (i1 + 1) * 32 - b1;
+        }
     }
 
     FragC frag_c[2];
@@ -342,19 +345,26 @@ __global__ void exl3_gemm_kernel_v2(
         // Batch the lane's window-word loads (independent), then decode from
         // registers — the v1 form re-enters memory inside each dependent
         // decode chain.
-        uint32_t wb[16];
-#pragma unroll
-        for (int j = 0; j < 8; j++)
-        {
-            wb[2 * j] = tile32[wp0[j]];
-            wb[2 * j + 1] = tile32[wp1[j]];
-        }
         half w[8];
-#pragma unroll
-        for (int j = 0; j < 8; j++)
+        if constexpr (HALF_K)
         {
-            const uint32_t w0 = __funnelshift_r(wb[2 * j + 1], wb[2 * j], ws0[j]) & 0xffffu;
-            w[j] = decode_3inst(w0, cb);
+            dq8_half_rt<BITS>(tile32, lane << 3, cb, w);
+        }
+        else
+        {
+            uint32_t wb[16];
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+            {
+                wb[2 * j] = tile32[wp0[j]];
+                wb[2 * j + 1] = tile32[wp1[j]];
+            }
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+            {
+                const uint32_t w0 = __funnelshift_r(wb[2 * j + 1], wb[2 * j], ws0[j]) & 0xffffu;
+                w[j] = decode_3inst(w0, cb);
+            }
         }
 
         const half* x0k = x0 + kk * 16;
@@ -536,14 +546,14 @@ __global__ void exl3_reduce_epilogue_kernel(
 // and loop MP m-tiles doing 2 MMAs each. Kills v1's per-m-tile re-decode of
 // the whole K range (31 TFLOPS = 15% of tensor peak at m=4096). Same fp32
 // workspace + reduce kernel as v2; grid gains the m-group dimension.
-template <int BITS, int MP>
+template <int BITS, int MP, bool HALF_K = false>
 __global__ void exl3_gemm_kernel_v3(
     const half* __restrict__ g_x,
     const uint16_t* __restrict__ g_packed,
     float* __restrict__ g_ws,          // (col_blocks, splits, m, n) fp32
     int m, int k, int n, int n16, int cb, int splits)
 {
-    constexpr int words16 = BITS * 16;
+    constexpr int words16 = BITS * 16 + (HALF_K ? 8 : 0);
     const int t = threadIdx.x;
     const int lane = t & 31;
     const int warp = t >> 5;
@@ -557,17 +567,20 @@ __global__ void exl3_gemm_kernel_v3(
 
     constexpr int n_words = BITS * 256 / 32;
     int wp0[8], wp1[8], ws0[8];
-#pragma unroll
-    for (int j = 0; j < 8; j++)
+    if constexpr (!HALF_K)
     {
-        const int e = lane * 8 + j;
-        const int b0 = e * BITS + BITS - 16 + 256 * BITS;
-        const int b1 = b0 + 16;
-        const int i0 = b0 / 32;
-        const int i1 = (b1 - 1) / 32;
-        wp0[j] = i0 % n_words;
-        wp1[j] = i1 % n_words;
-        ws0[j] = (i1 + 1) * 32 - b1;
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+        {
+            const int e = lane * 8 + j;
+            const int b0 = e * BITS + BITS - 16 + 256 * BITS;
+            const int b1 = b0 + 16;
+            const int i0 = b0 / 32;
+            const int i1 = (b1 - 1) / 32;
+            wp0[j] = i0 % n_words;
+            wp1[j] = i1 % n_words;
+            ws0[j] = (i1 + 1) * 32 - b1;
+        }
     }
 
     FragC frag_c[MP][2];
@@ -585,19 +598,26 @@ __global__ void exl3_gemm_kernel_v3(
     {
         const uint32_t* tile32 =
             (const uint32_t*)(g_packed + ((kk * n16) + col_block * 8 + warp) * words16);
-        uint32_t wb[16];
-#pragma unroll
-        for (int j = 0; j < 8; j++)
-        {
-            wb[2 * j] = tile32[wp0[j]];
-            wb[2 * j + 1] = tile32[wp1[j]];
-        }
         half w[8];
-#pragma unroll
-        for (int j = 0; j < 8; j++)
+        if constexpr (HALF_K)
         {
-            const uint32_t w0 = __funnelshift_r(wb[2 * j + 1], wb[2 * j], ws0[j]) & 0xffffu;
-            w[j] = decode_3inst(w0, cb);
+            dq8_half_rt<BITS>(tile32, lane << 3, cb, w);
+        }
+        else
+        {
+            uint32_t wb[16];
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+            {
+                wb[2 * j] = tile32[wp0[j]];
+                wb[2 * j + 1] = tile32[wp1[j]];
+            }
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+            {
+                const uint32_t w0 = __funnelshift_r(wb[2 * j + 1], wb[2 * j], ws0[j]) & 0xffffu;
+                w[j] = decode_3inst(w0, cb);
+            }
         }
 
         FragB fb0, fb1;
@@ -702,9 +722,16 @@ void sgl_exl3_linear(
     const int n = svh.size(0);
     const int k16 = packed.size(0);
     const int n16 = packed.size(1);
-    const int bits = packed.size(2) / 16;
+    const int wb = packed.size(2);
+    const int bits = wb / 16;
     TORCH_CHECK(k == k16 * 16 && n == n16 * 16, "exl3 linear: packed shape mismatch");
     TORCH_CHECK(k % 128 == 0 && n % 128 == 0, "exl3 linear: k/n must be multiples of 128");
+    // Half-integer bitrates (KA + 0.5, mul1 codebook only): the packed third
+    // dim is 16*KA + 8, so wb % 16 == 8. Integer rates: wb == 16*bits.
+    const bool half_k = (wb % 16) != 0;
+    TORCH_CHECK(!half_k || wb % 8 == 0, "exl3 linear: packed third dim must be a multiple of 8");
+    TORCH_CHECK(!half_k || cb == 2, "exl3 linear: half-integer bitrates are mul1-only");
+    TORCH_CHECK(!half_k || (wb / 16) >= 1 && (wb / 16) <= 7, "exl3 linear: half bitrate out of range");
     TORCH_CHECK(bits >= 1 && bits <= 8, "exl3 linear: bitrate out of range 1..8");
     TORCH_CHECK(cb >= 0 && cb <= 2, "exl3 linear: cb out of range");
     TORCH_CHECK(out.size(0) == m && out.size(1) == n, "exl3 linear: out shape mismatch");
@@ -746,14 +773,14 @@ void sgl_exl3_linear(
         dim3 grid(col_blocks, splits);
         switch (bits)
         {
-            case 1: exl3::exl3_gemm_kernel_v2<1, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
-            case 2: exl3::exl3_gemm_kernel_v2<2, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
-            case 3: exl3::exl3_gemm_kernel_v2<3, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
-            case 4: exl3::exl3_gemm_kernel_v2<4, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
-            case 5: exl3::exl3_gemm_kernel_v2<5, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
-            case 6: exl3::exl3_gemm_kernel_v2<6, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
-            case 7: exl3::exl3_gemm_kernel_v2<7, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
-            case 8: exl3::exl3_gemm_kernel_v2<8, 16><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
+            case 1: if (half_k) exl3::exl3_gemm_kernel_v2<1, 16, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); else exl3::exl3_gemm_kernel_v2<1, 16, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
+            case 2: if (half_k) exl3::exl3_gemm_kernel_v2<2, 16, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); else exl3::exl3_gemm_kernel_v2<2, 16, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
+            case 3: if (half_k) exl3::exl3_gemm_kernel_v2<3, 16, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); else exl3::exl3_gemm_kernel_v2<3, 16, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
+            case 4: if (half_k) exl3::exl3_gemm_kernel_v2<4, 16, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); else exl3::exl3_gemm_kernel_v2<4, 16, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
+            case 5: if (half_k) exl3::exl3_gemm_kernel_v2<5, 16, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); else exl3::exl3_gemm_kernel_v2<5, 16, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
+            case 6: if (half_k) exl3::exl3_gemm_kernel_v2<6, 16, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); else exl3::exl3_gemm_kernel_v2<6, 16, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
+            case 7: if (half_k) exl3::exl3_gemm_kernel_v2<7, 16, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); else exl3::exl3_gemm_kernel_v2<7, 16, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
+            case 8: if (half_k) exl3::exl3_gemm_kernel_v2<8, 16, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); else exl3::exl3_gemm_kernel_v2<8, 16, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, cp, mi, ki, ni, n16i, icb, splits, svp, bias_ptr, op, bf16_out); break;
             default: TORCH_CHECK(false, "exl3 linear: unsupported bitrate");
         }
         return;
@@ -775,14 +802,14 @@ void sgl_exl3_linear(
         dim3 grid(col_blocks, splits, m_groups);
         switch (bits)
         {
-            case 1: exl3::exl3_gemm_kernel_v3<1, MP><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 2: exl3::exl3_gemm_kernel_v3<2, MP><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 3: exl3::exl3_gemm_kernel_v3<3, MP><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 4: exl3::exl3_gemm_kernel_v3<4, MP><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 5: exl3::exl3_gemm_kernel_v3<5, MP><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 6: exl3::exl3_gemm_kernel_v3<6, MP><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 7: exl3::exl3_gemm_kernel_v3<7, MP><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 8: exl3::exl3_gemm_kernel_v3<8, MP><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
+            case 1: if (half_k) exl3::exl3_gemm_kernel_v3<1, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); else exl3::exl3_gemm_kernel_v3<1, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
+            case 2: if (half_k) exl3::exl3_gemm_kernel_v3<2, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); else exl3::exl3_gemm_kernel_v3<2, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
+            case 3: if (half_k) exl3::exl3_gemm_kernel_v3<3, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); else exl3::exl3_gemm_kernel_v3<3, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
+            case 4: if (half_k) exl3::exl3_gemm_kernel_v3<4, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); else exl3::exl3_gemm_kernel_v3<4, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
+            case 5: if (half_k) exl3::exl3_gemm_kernel_v3<5, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); else exl3::exl3_gemm_kernel_v3<5, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
+            case 6: if (half_k) exl3::exl3_gemm_kernel_v3<6, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); else exl3::exl3_gemm_kernel_v3<6, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
+            case 7: if (half_k) exl3::exl3_gemm_kernel_v3<7, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); else exl3::exl3_gemm_kernel_v3<7, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
+            case 8: if (half_k) exl3::exl3_gemm_kernel_v3<8, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); else exl3::exl3_gemm_kernel_v3<8, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
             default: TORCH_CHECK(false, "exl3 linear: unsupported bitrate");
         }
         dim3 rgrid(col_blocks, (mi + 15) / 16);

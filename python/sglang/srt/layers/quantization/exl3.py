@@ -240,7 +240,38 @@ def trellis_dequant_f16(trellis: torch.Tensor, codebook: str) -> torch.Tensor:
     assert trellis.dtype == torch.int16, "exl3 trellis must be int16"
     assert trellis.ndim == 3, "exl3 trellis must have dim = 3"
     k16, n16, wb = trellis.shape
-    assert wb % 16 == 0, "exl3 trellis third dim must be a multiple of 16"
+    if wb % 16 == 8:
+        # Half-integer bitrate KA + 0.5 (mul1 codebook only): positions
+        # alternate KA (even) / KA+1 (odd) bits, 2 positions per 2*KA+1 bits.
+        assert codebook == "mul1", "exl3 half-integer bitrates are mul1-only"
+        ka = wb // 16
+        assert 1 <= ka <= 7, "exl3 half bitrate out of range"
+        bits2 = 2 * ka + 1
+        total_bits = 128 * bits2  # one 16x16 tile, circular
+        pairs = trellis.view(k16, n16, wb // 2, 2).to(torch.int64) & 0xFFFF
+        w32 = (pairs[..., 0] & 0xFFFF) | ((pairs[..., 1] & 0xFFFF) << 16)
+        t = torch.arange(256, dtype=torch.int64, device=w32.device)
+        end = (t // 2) * bits2 + ka + (t % 2) * (ka + 1)
+        b0 = end - 16 + total_bits          # circular window start
+        i0 = b0 // 32
+        i1 = (end - 1 + total_bits) // 32
+        s0 = (i1 + 1) * 32 - (end + total_bits)
+        n_words = wb // 2  # uint32 words per tile
+        a_idx = (i0 % n_words).clamp(0, n_words - 1)
+        b_idx = (i1 % n_words).clamp(0, n_words - 1)
+        A = w32[..., a_idx]
+        B = w32[..., b_idx]
+        shift = (32 - s0).clamp(0, 63)
+        hi_branch = ((B >> s0) | (A << shift)) & 0xFFFF
+        lo_branch = (B >> s0) & 0xFFFF
+        lo_mask = s0 <= 16
+        windows = torch.where(lo_mask, lo_branch, hi_branch)
+        lanes = _decode_codebook(windows, codebook)
+        perm = _fp16_cache_perm()
+        rm = lanes[..., perm]
+        rm = rm.view(k16, n16, 16, 16).permute(0, 2, 1, 3).reshape(k16 * 16, n16 * 16)
+        return rm.contiguous()
+    assert wb % 16 == 0, "exl3 trellis third dim must be a multiple of 8"
     bits = wb // 16
     assert 1 <= bits <= 8, "exl3 bitrate out of range 1..8"
     pairs = trellis.view(k16, n16, 8 * bits, 2).to(torch.int64) & 0xFFFF

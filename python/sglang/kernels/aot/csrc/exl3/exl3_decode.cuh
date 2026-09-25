@@ -96,6 +96,39 @@ __device__ inline half decode_3inst(uint32_t x, int cb)
     return __hfma(h, k_inv_h, k_bias_h);
 }
 
+// Half-integer bitrate KA + 0.5 (mul1 codebook only): positions alternate KA
+// and KA+1 bits (odd positions carry the extra bit). Verbatim port of
+// ExLlamaV3 exl3_dq.cuh dq8_half with the runtime-codebook decode. Produces
+// the lane's 8 window values in fragment order.
+template <int KA>
+__device__ __forceinline__ void dq8_half_rt(const uint32_t* ptr, int t_offset, int cb, half* out8)
+{
+    constexpr int bits2 = 2 * KA + 1;                       // bits per two positions
+    constexpr int words = 4 * bits2;                        // uint32 per 256-weight tile
+    constexpr int gspan = 18 + 3 * KA;                      // bits spanned by four windows
+    const int e7 = ((t_offset >> 1) + 4) * bits2 + 128 * bits2;   // end bit of window 7 (+ one tile wrap)
+    const int e3 = e7 - 2 * bits2;                                // end bit of window 3
+    uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+    {
+        int hi = (e7 - 1) / 32, lo = (e7 - gspan) / 32, s = (hi + 1) * 32 - e7;
+        uint32_t a = ptr[lo % words], b = ptr[hi % words];
+        w7 = fshift(b, a, s); w6 = w7 >> (KA + 1); w5 = w6 >> KA; w4 = w5 >> (KA + 1);
+    }
+    {
+        int hi = (e3 - 1) / 32, lo = (e3 - gspan) / 32, s = (hi + 1) * 32 - e3;
+        uint32_t a = ptr[lo % words], b = ptr[hi % words];
+        w3 = fshift(b, a, s); w2 = w3 >> (KA + 1); w1 = w2 >> KA; w0 = w1 >> (KA + 1);
+    }
+    out8[0] = decode_3inst(w0 & 0xffff, cb);
+    out8[1] = decode_3inst(w1 & 0xffff, cb);
+    out8[2] = decode_3inst(w2 & 0xffff, cb);
+    out8[3] = decode_3inst(w3 & 0xffff, cb);
+    out8[4] = decode_3inst(w4 & 0xffff, cb);
+    out8[5] = decode_3inst(w5 & 0xffff, cb);
+    out8[6] = decode_3inst(w6 & 0xffff, cb);
+    out8[7] = decode_3inst(w7 & 0xffff, cb);
+}
+
 // General 16-bit codebook window for element t_offset of one 16x16 tile.
 // Circular indexing and window alignment are verbatim ExLlamaV3 exl3_dq.cuh:
 // element t's window spans bits [(t+1)*b + 256*b - 16, (t+1)*b + 256*b).
