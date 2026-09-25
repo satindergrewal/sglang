@@ -1787,6 +1787,27 @@ class KVCacheConfigurator:
                 "swa_v_head_dim": self.model_config.swa_v_head_dim,
                 "v_head_dim": self.model_config.v_head_dim,
             }
+        else:
+            # Asymmetric full/SWA geometry in general (e.g. MiMo-V2: full
+            # nkv=4, SWA nkv=8, both v_head_dim 128 < head_dim 192). Without
+            # these the SWA sub-pool is built with the full-attention
+            # geometry — half the KV heads and head_dim-wide V buffers — so
+            # every SWA layer's cache writes/reads are misaligned.
+            hfc = self.model_config.hf_text_config
+            v_head_dim = getattr(hfc, "v_head_dim", None)
+            swa_head_num = getattr(hfc, "swa_num_key_value_heads", None)
+            swa_head_dim = getattr(hfc, "swa_head_dim", None)
+            swa_v_head_dim = getattr(hfc, "swa_v_head_dim", None)
+            if v_head_dim is not None and v_head_dim != self.model_config.head_dim:
+                kwargs["v_head_dim"] = v_head_dim
+            if swa_head_num is not None:
+                kwargs["swa_head_num"] = max(
+                    1, swa_head_num // get_parallel().attn_tp_size
+                )
+            if swa_head_dim is not None:
+                kwargs["swa_head_dim"] = swa_head_dim
+            if swa_v_head_dim is not None:
+                kwargs["swa_v_head_dim"] = swa_v_head_dim
         swa_pool_class = (
             MHATokenToKVPoolMXFP8
             if self.kv_cache_dtype_str == "mxfp8"
