@@ -896,6 +896,22 @@ class ExL3MoEMethod(FusedMoEMethodBase):
                 raise RuntimeError(
                     "exl3 MoE: expert weights must arrive with an expert_id"
                 )
+            # This loader replaces the FusedMoE param's default weight_loader,
+            # so the global->local EP localization that weight_loader performs
+            # no longer runs. Localize here: experts outside this rank's
+            # storage range are skipped, and records are keyed by LOCAL id
+            # (process_weights_after_loading iterates range(num_local_experts)).
+            num_local = getattr(layer, "_num_local_routed", None)
+            if num_local is None:
+                num_local = getattr(layer, "num_local_experts", None)
+            storage_rank = getattr(layer, "_expert_storage_rank", None)
+            if storage_rank is None:
+                storage_rank = getattr(layer, "moe_ep_rank", 0)
+            if num_local is not None:
+                start = storage_rank * num_local
+                if not (start <= expert_id < start + num_local):
+                    return
+                expert_id = expert_id - start
             key = (expert_id, prefix, shard_id, suffix)
             layer._exl3_moe_records.setdefault(key, []).append(loaded_weight)
 
