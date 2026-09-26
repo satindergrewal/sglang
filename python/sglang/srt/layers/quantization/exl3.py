@@ -759,6 +759,19 @@ class ExL3HeadMethod(ExL3LinearMethod):
             piece = dequant_matrix_orig(trellis[:, start // 16:end // 16, :],
                                         suh, svh[start:end], cb)  # (in, end-start) fp16
             layer.weight.data[start:end].copy_(piece.t())
+        import os as _os
+        if _os.environ.get("SGLANG_DEBUG_HEAD"):
+            torch.save(
+                {
+                    "weight_rows0": layer.weight.data[:8].cpu(),
+                    "weight_absmax": layer.weight.data.abs().max().cpu(),
+                    "svh0": svh[:8].cpu(),
+                    "suh0": suh[:8].cpu(),
+                    "trellis00": trellis[0, 0, :16].cpu(),
+                    "vocab": vocab,
+                },
+                f"/dump/head_debug_rank{__import__('sglang.srt.runtime_context', fromlist=['get_parallel']).get_parallel().tp_rank}.pt",
+            )
         layer._exl3_groups = []
         layer._exl3_records = {}
         g.clear()
@@ -907,6 +920,10 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         dt = self.params_dtype
         dev = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         gated = self.moe_runner_config.is_gated if self.moe_runner_config else True
+        # interm_div convention (see _process_packed): the dequant path scales the
+        # up rows of w13 by 1/comp and the packed runner folds comp into routing.
+        interm_comp = float(getattr(layer, "interm_comp", 1.0) or 1.0)
+        self._interm_comp = interm_comp
         w13_n = 2 * I if gated else I
         w13 = torch.empty((E, w13_n, H), dtype=dt, device=dev)
         w2 = torch.empty((E, H, I), dtype=dt, device=dev)
@@ -942,6 +959,8 @@ class ExL3MoEMethod(FusedMoEMethodBase):
                          cb_of(e, "w13", "w1"))  # (H, I)
                 uw = deq(get(e, "w13", "w3", "trellis"), get(e, "w13", "w3", "suh"),
                          get(e, "w13", "w3", "svh"), cb_of(e, "w13", "w3"))
+                if interm_comp != 1.0:
+                    uw = uw * (1.0 / interm_comp)
                 dw = deq(dtt, get(e, "w2", "w2", "suh"), get(e, "w2", "w2", "svh"),
                          cb_of(e, "w2", "w2"))  # (I, H)
                 w13[e] = torch.cat(
@@ -996,6 +1015,11 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         E = layer.num_local_experts
         dev = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         gated = self.moe_runner_config.is_gated if self.moe_runner_config else True
+        # Upstream EXL3 interm_div convention (exllamav3 MiMoV2, last MoE layer):
+        # the layer's up_proj is packed divided by interm_comp (128) so the fp16
+        # intermediate stays in range, and the routing weights carry the ×128
+        # compensation. The packed runner applies it after top-k normalization.
+        self._interm_comp = float(getattr(layer, "interm_comp", 1.0) or 1.0)
 
         def get(e, prefix, shard, suffix):
             lst = recs.get((e, prefix, shard, suffix))
@@ -1086,6 +1110,9 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         sids = key[order]
         tok = order // K
         pw = wts.reshape(-1)[order].float()
+        comp = getattr(self, "_interm_comp", 1.0) or 1.0
+        if comp != 1.0:
+            pw = pw * comp
         rsf = runner_config.routed_scaling_factor
         if rsf is not None:
             pw = pw * rsf

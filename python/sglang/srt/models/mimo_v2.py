@@ -456,6 +456,17 @@ class MiMoV2MoE(nn.Module):
             routed_scaling_factor=1.0,
             prefix=add_prefix("experts", prefix),
         )
+        # Upstream EXL3 convention (exllamav3 MiMoV2): the LAST MoE layer's routed
+        # experts take act(gate)*up past the fp16 max (~84k on some tokens), so its
+        # up_proj is stored divided by 128 and the compensation is folded into the
+        # routing weights after top-k normalization. Mirror that: mark the layer so
+        # the quant method's packed runner scales the routing weights.
+        if (
+            self.layer_id == len(config.hybrid_layer_pattern) - 1
+            and quant_config is not None
+            and quant_config.get_name() == "exl3"
+        ):
+            self.experts.interm_comp = 128.0
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
