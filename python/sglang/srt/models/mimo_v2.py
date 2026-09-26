@@ -15,6 +15,7 @@
 import logging
 import math
 import re
+from array import array
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -177,6 +178,36 @@ def _get_ckpt_qkv_shard_sizes(config, layer_name, ckpt_tp):
     k_per_shard = max(1, nkv // ckpt_tp) * hd
     v_per_shard = max(1, nkv // ckpt_tp) * vhd
     return (q_per_shard, k_per_shard, v_per_shard)
+
+
+def _slice_head_dim_v_proj(name: str, t: torch.Tensor, hf_config) -> torch.Tensor:
+    """MiMo-V2 checkpoints may store v_proj at nkv*head_dim columns (V padded
+    with zero lanes up to head_dim); the model consumes nkv*v_head_dim. Only a
+    plain 2-D matrix may be sliced here: slicing must happen AFTER the output
+    Hadamard, and head_dim (192) straddles the 128-column Hadamard blocks, so
+    trellis/svh/bias tensors of EXL3 checkpoints are loaded full-width and the
+    zero lanes are dropped post-GEMM instead (see MiMoV2Attention)."""
+    if ".v_proj." not in name:
+        return t
+    pattern = getattr(hf_config, "hybrid_layer_pattern", None)
+    m = re.search(r"layers\.(\d+)\.", name)
+    if pattern is None or m is None:
+        return t
+    layer_id = int(m.group(1))
+    if pattern[layer_id] == 1:
+        nkv = hf_config.swa_num_key_value_heads
+        hd = hf_config.swa_head_dim
+        vhd = getattr(hf_config, "swa_v_head_dim", hd)
+    else:
+        nkv = hf_config.num_key_value_heads
+        hd = hf_config.head_dim
+        vhd = getattr(hf_config, "v_head_dim", hd)
+    if vhd >= hd:
+        return t
+    want = nkv * vhd
+    if name.endswith(".weight") and t.ndim == 2 and t.shape[0] == nkv * hd:
+        return t.view(nkv, hd, t.shape[1])[:, :vhd, :].reshape(want, t.shape[1])
+    return t
 
 
 def _deinterleave_qkv_shards(shards, q_per_shard, k_per_shard, v_per_shard):
@@ -425,6 +456,17 @@ class MiMoV2MoE(nn.Module):
             routed_scaling_factor=1.0,
             prefix=add_prefix("experts", prefix),
         )
+        # Upstream EXL3 convention (exllamav3 MiMoV2): the LAST MoE layer's routed
+        # experts take act(gate)*up past the fp16 max (~84k on some tokens), so its
+        # up_proj is stored divided by 128 and the compensation is folded into the
+        # routing weights after top-k normalization. Mirror that: mark the layer so
+        # the quant method's packed runner scales the routing weights.
+        if (
+            self.layer_id == len(config.hybrid_layer_pattern) - 1
+            and quant_config is not None
+            and quant_config.get_name() == "exl3"
+        ):
+            self.experts.interm_comp = 128.0
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -515,7 +557,7 @@ class MiMoV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -548,7 +590,7 @@ class MiMoV2MoE(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
                     ),
@@ -642,7 +684,29 @@ class MiMoV2Attention(nn.Module):
         self.k_size = self.num_kv_heads * self.head_dim
         self.v_size = self.num_kv_heads * self.v_head_dim
 
-        self.v_scale = v_scale
+        # EXL3 checkpoints quantize v_proj at head_dim width (HF stores V padded
+        # with zero lanes up to head_dim). head_dim=192 straddles the 128-column
+        # Hadamard blocks of the trellis format, so the packed tensors cannot be
+        # sliced per head at load; the fused GEMM stays full-width and the zero
+        # lanes are dropped right after it. Plain checkpoints already store v at
+        # nkv*v_head_dim and need none of this.
+        self.v_ckpt_full = (
+            quant_config is not None
+            and quant_config.get_name() == "exl3"
+            and self.v_head_dim != self.head_dim
+        )
+        self.v_ckpt_size = (
+            self.num_kv_heads * self.head_dim if self.v_ckpt_full else self.v_size
+        )
+        # EXL3 packs fold attention_value_scale into o_proj at encode time
+        # (exllamav3: attn.o_proj.weight_scale = attention_value_scale), so the
+        # runtime must not scale V again or every attention contribution is
+        # 0.7071x too small — enough to flip this model's chaotic top-8 routing.
+        self.v_scale = (
+            None
+            if self.v_ckpt_full
+            else v_scale
+        )
 
         self.scaling = self.head_dim**-0.5
 
@@ -651,7 +715,7 @@ class MiMoV2Attention(nn.Module):
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            v_head_size=self.v_head_dim,
+            v_head_size=self.head_dim if self.v_ckpt_full else self.v_head_dim,
             bias=attention_bias,
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
@@ -719,7 +783,10 @@ class MiMoV2Attention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        q, k, v = qkv.split([self.q_size, self.k_size, self.v_ckpt_size], dim=-1)
+        if self.v_ckpt_full:
+            v = v.reshape(*v.shape[:-1], self.num_kv_heads, self.head_dim)
+            v = v[..., : self.v_head_dim].reshape(*v.shape[:-2], self.v_size)
 
         q, k = self.rotary_emb(positions, q, k)
         if self.v_scale is not None:
@@ -746,7 +813,10 @@ class MiMoV2Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        q, k, v = qkv.split([self.q_size, self.k_size, self.v_ckpt_size], dim=-1)
+        if self.v_ckpt_full:
+            v = v.reshape(*v.shape[:-1], self.num_kv_heads, self.head_dim)
+            v = v[..., : self.v_head_dim].reshape(*v.shape[:-2], self.v_size)
 
         # [t, h, dr]
         q, k = self.rotary_emb(positions, q, k)
@@ -1279,7 +1349,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         )
         return self.model.get_input_embedding(input_ids)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -1491,6 +1561,8 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
 
             if not self._is_multimodal and (is_vision_weight or is_audio_weight):
                 continue
+
+            loaded_weight = _slice_head_dim_v_proj(name, loaded_weight, self.config)
 
             if self.config.encoder_only and name.startswith(
                 self._LANGUAGE_WEIGHT_PREFIXES
