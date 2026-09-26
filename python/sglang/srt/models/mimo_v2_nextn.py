@@ -42,6 +42,7 @@ from sglang.srt.models.mimo_v2 import (
     MiMoV2Attention,
     MiMoV2ForCausalLM,
     MiMoV2MLP,
+    _resolve_deferred_qkv_scale_inv,
     load_mimo_v2_qkv_proj_weight,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -281,6 +282,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        deferred_qkv_scale_inv: Dict[str, torch.Tensor] = {}
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -315,6 +317,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                         expected_fused_tp_size=get_mimo_v2_fused_qkv_expected_tp_size(
                             self.config
                         ),
+                        deferred_scale_inv=deferred_qkv_scale_inv,
                     )
                 continue
 
@@ -358,6 +361,14 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
 
+        if deferred_qkv_scale_inv:
+            _resolve_deferred_qkv_scale_inv(
+                params_dict,
+                deferred_qkv_scale_inv,
+                get_mimo_v2_fused_qkv_expected_tp_size(self.config),
+                config=self.config,
+            )
+
     def map_model_name_to_mtp_param_name(self, name: str) -> str:
         import re
 
@@ -379,6 +390,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                     return name
             name = name.replace(group.group(), "model.mtp_block.")
         return name
+
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
