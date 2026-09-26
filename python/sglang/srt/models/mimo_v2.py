@@ -698,8 +698,15 @@ class MiMoV2Attention(nn.Module):
         self.v_ckpt_size = (
             self.num_kv_heads * self.head_dim if self.v_ckpt_full else self.v_size
         )
-
-        self.v_scale = v_scale
+        # EXL3 packs fold attention_value_scale into o_proj at encode time
+        # (exllamav3: attn.o_proj.weight_scale = attention_value_scale), so the
+        # runtime must not scale V again or every attention contribution is
+        # 0.7071x too small — enough to flip this model's chaotic top-8 routing.
+        self.v_scale = (
+            None
+            if self.v_ckpt_full
+            else v_scale
+        )
 
         self.scaling = self.head_dim**-0.5
 
