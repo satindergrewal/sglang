@@ -1020,6 +1020,7 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         # intermediate stays in range, and the routing weights carry the ×128
         # compensation. The packed runner applies it after top-k normalization.
         self._interm_comp = float(getattr(layer, "interm_comp", 1.0) or 1.0)
+        logger.info("exl3 MoE packed: interm_comp=%s layer=%s", self._interm_comp, getattr(layer, 'layer_id', '?'))
 
         def get(e, prefix, shard, suffix):
             lst = recs.get((e, prefix, shard, suffix))
@@ -1097,9 +1098,15 @@ class ExL3MoEMethod(FusedMoEMethodBase):
                 "exl3 MoE packed: apply_router_weight_on_input is not supported"
             )
         x = hs.reshape(-1, hs.shape[-1])
-        if x.dtype not in (torch.float16, torch.bfloat16):
-            x = x.to(torch.float16)
-        out_dt = x.dtype
+        # The expert chain runs in fp16, matching the reference EXL3 runtime's
+        # numerics contract. This model's MoE down-projections are
+        # cancellation-heavy (up-projections reach ~65k while the routed output
+        # is O(1)), so bf16 intermediates (8-bit mantissa) inject several times
+        # the reference noise floor and flip the chaotic top-8 routing; fp16
+        # keeps every intermediate inside fp16 range under the interm_div
+        # convention and tracks the official serve layer-for-layer.
+        x = x.to(torch.float16)
+        out_dt = torch.float16
         E = len(packed["down"])
         K = ids.shape[-1]
         flat = ids.reshape(-1).to(torch.long)
