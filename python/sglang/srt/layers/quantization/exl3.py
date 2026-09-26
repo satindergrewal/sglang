@@ -1093,6 +1093,13 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         if matrix[0] == "plain":
             return F.linear(x2, matrix[1]).to(out_dt)
         _, trellis, suh, svh, bias, cb = matrix
+        if os.environ.get("EXL3_MOE_NO_KERNEL") == "1":
+            # Isolation path: dequant-on-apply in pure torch, keeping the
+            # packed MoE plumbing (EP sharding, routing fold) intact.
+            w = dequant_matrix_orig(
+                trellis, suh, svh, {0: "default", 1: "mcg", 2: "mul1"}[cb]
+            ).to(x2.dtype)
+            return F.linear(x2, w).to(out_dt)
         xh = torch.empty(x2.shape, dtype=torch.float16, device=x2.device)
         torch.ops.sgl_kernel.sgl_exl3_had_in(x2, suh, xh)
         out = torch.empty((x2.shape[0], svh.shape[0]), dtype=out_dt, device=x2.device)
