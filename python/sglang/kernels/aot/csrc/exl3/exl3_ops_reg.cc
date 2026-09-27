@@ -25,11 +25,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)
 {
     m.def("sgl_exl3_had_in(Tensor x, Tensor suh, Tensor(a!) out) -> ()");
     m.def("sgl_exl3_linear(Tensor x_had, Tensor packed, Tensor svh, Tensor? bias, int cb, Tensor(a!) out) -> ()");
-    m.def("grouped_had_in(Tensor x, Tensor suh_ptrs, Tensor counts, Tensor offsets, int rows_cap, Tensor(a!) out) -> ()");
 }
 
 TORCH_LIBRARY(sgl_exl3_grouped, m)
 {
+    m.def("grouped_had_in(Tensor x, Tensor suh_ptrs, Tensor counts, Tensor offsets, int rows_cap, Tensor(a!) out) -> ()");
     m.def("grouped_linear(Tensor x, Tensor packed_ptrs, Tensor svh_ptrs, Tensor bias_ptrs, "
           "Tensor counts, Tensor offsets, Tensor ws, Tensor cnt_buf, int cb, int splits, "
           "int chunks_cap, int bits, int half_k, Tensor(a!) out) -> ()");
@@ -38,11 +38,11 @@ TORCH_LIBRARY(sgl_exl3_grouped, m)
 TORCH_LIBRARY_IMPL(sgl_kernel, CUDA, m)
 {
     m.impl("sgl_exl3_had_in", torch::kCUDA, &sgl_exl3_had_in);
-    m.impl("grouped_had_in", torch::kCUDA, &exl3::sgl_exl3_grouped_had_in);
     m.impl("sgl_exl3_linear", torch::kCUDA, &sgl_exl3_linear);
 }
 
 TORCH_LIBRARY_IMPL(sgl_exl3_grouped, CUDA, m)
 {
+    m.impl("grouped_had_in", torch::kCUDA, &exl3::sgl_exl3_grouped_had_in);
     m.impl("grouped_linear", torch::kCUDA, &exl3::sgl_exl3_grouped_linear);
 }
