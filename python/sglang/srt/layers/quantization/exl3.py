@@ -1138,7 +1138,13 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             sv[n_exp] = 0
             bi[n_exp] = 0
             keep_alive.extend(keep)
+            # suh device pointers (input-side Hadamard scales) for the
+            # grouped had_in kernel — one per expert, sentinel = null.
+            su = torch.zeros(n_exp + 1, dtype=torch.int64, device=dev)
+            for i, mat in enumerate(packed[proj]):
+                su[i] = mat[2].data_ptr()
             return {"ptrs": pk, "svh_ptrs": sv, "bias_ptrs": bi,
+                    "svh_dev_ptrs": su,
                     "bits": bits, "half_k": half_k, "cb": cb, "n_out": n_out}
 
         keep_alive = []
@@ -1151,6 +1157,7 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             packed[f"{proj}_half_k"] = meta["half_k"]
             packed[f"{proj}_cb"] = meta["cb"]
             packed[f"{proj}_suh_keep"] = [m[2] for m in packed[proj]]
+            packed[f"{proj}_suh_ptrs_dev"] = meta["svh_dev_ptrs"]
             if proj == "down":
                 packed["down_n"] = meta["n_out"]
             else:
@@ -1218,23 +1225,26 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         rsf = runner_config.routed_scaling_factor
         if rsf is not None:
             pw = pw * rsf
-        counts = torch.histc(sids.float(), bins=E + 1, min=0, max=E).to(torch.int32)
+        counts = torch.histc(sids.float(), bins=E, min=0, max=E - 1).to(torch.int32)
+        # Sentinel slot appended as a device-side zero (no H2D scalar copy —
+        # `counts[E] = 0` would be an index_put with a CPU scalar, which is
+        # illegal inside CUDA graph capture).
+        counts = torch.cat(
+            [counts, torch.zeros(1, dtype=torch.int32, device=counts.device)]
+        )
         offsets = torch.zeros(E + 2, dtype=torch.int64, device=x.device)
         offsets[1:] = counts.cumsum(0).to(torch.int64)
         x_pairs = x[tok].contiguous()
-        # ONE host sync per call for the python-side staging loops (had_in
-        # segmentation); counts[E] zeroed on the GPU copy used by the kernel.
-        counts_cpu = counts.cpu()
-        counts_cpu[E] = 0  # sentinel slot: kernel skips it; so must staging
-        offsets_cpu = offsets.cpu()
+        # Fully device-side: no D2H syncs in this path (CUDA-graph-safe).
+        # The sentinel count is zeroed on the GPU tensor the kernel reads.
         # The sentinel slot E (remote pairs) has NULL pointer entries in the
         # arrays — zero its count so the kernel never dereferences slot E,
         # and zero the remote pairs' weights so their (unprocessed) output
         # rows contribute nothing at the combine. The mask must follow the
         # SORTED order (pw is wts[order]); sids == key[order].
-        counts[E] = 0
         pw = torch.where(sids < E, pw, torch.zeros_like(pw))
-        if int(counts_cpu[:E].max().item()) > 16 * 4:
+        if (not torch.cuda.is_current_stream_capturing()
+                and int(counts[:E].max().item()) > 16 * 4):
             raise MoEGroupedOverflow()
 
         CH = 4
@@ -1246,11 +1256,14 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             ws_cache = self._grouped_ws_make(E, packed)
         _, ws_by, cnt_by = ws_cache
 
-        def grouped_gemm(xp, proj, n_out, splits):
+        def grouped_gemm(xp, proj, n_out, splits, zero_init=False):
             cb_n = int(n_out // 128)
             ws = ws_by[(proj, cb_n)]
             cnt = cnt_by[(proj, cb_n)]
-            out = torch.empty((xp.shape[0], n_out), dtype=out_dt, device=dev)
+            out = (torch.zeros((xp.shape[0], n_out), dtype=out_dt, device=dev)
+                   if zero_init
+                   else torch.empty((xp.shape[0], n_out), dtype=out_dt,
+                                    device=dev))
             torch.ops.sgl_exl3_grouped.grouped_linear(
                 xp, packed[f"{proj}_ptrs"], packed[f"{proj}_svh_ptrs"],
                 packed[f"{proj}_bias_ptrs"], counts, offsets,
@@ -1258,22 +1271,16 @@ class ExL3MoEMethod(FusedMoEMethodBase):
                 packed[f"{proj}_bits"], packed[f"{proj}_half_k"], out)
             return out
 
-        # Per-expert input Hadamard: each projection pair (gate/up) has its
-        # own suh, so the shared pair rows are transformed once per projection.
+        # Per-expert input Hadamard: ONE kernel launch per projection, reading
+        # counts/offsets/suh-pointers on device (CUDA-graph-safe: fixed grid,
+        # data-dependence resolved at replay). Rows the kernel does not
+        # transform (zero-count experts, overflow, sentinel) are zeroed.
         xh_gate = torch.empty_like(x_pairs)
         xh_up = torch.empty_like(x_pairs)
-        for i in range(E):
-            s0 = int(offsets_cpu[i].item())
-            c = int(counts_cpu[i].item())
-            if c <= 0:
-                continue
-            for dst, suh_key in ((xh_gate, "gate"), (xh_up, "up")):
-                xh = torch.empty(x_pairs[s0:s0 + c].shape, dtype=torch.float16,
-                                 device=dev)
-                torch.ops.sgl_kernel.sgl_exl3_had_in(
-                    x_pairs[s0:s0 + c].contiguous(),
-                    packed[f"{suh_key}_suh_keep"][i], xh)
-                dst[s0:s0 + c] = xh
+        torch.ops.sgl_exl3_grouped.grouped_had_in(
+            x_pairs, packed["gate_suh_ptrs_dev"], counts, offsets, 64, xh_gate)
+        torch.ops.sgl_exl3_grouped.grouped_had_in(
+            x_pairs, packed["up_suh_ptrs_dev"], counts, offsets, 64, xh_up)
 
         import os as _os
         _probe = (
@@ -1286,6 +1293,8 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             ref = torch.zeros_like(x_pairs, dtype=torch.float16)
             ref = torch.zeros((x_pairs.shape[0], packed["down_n"]),
                               dtype=torch.float32, device=dev)
+            counts_cpu = counts.cpu(); counts_cpu[E] = 0
+            offsets_cpu = offsets.cpu()
             for i in range(E):
                 s0 = int(offsets_cpu[i].item()); c = int(counts_cpu[i].item())
                 if c <= 0: continue
@@ -1305,31 +1314,15 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             mid = (F.gelu(o_g.float()) * o_u.float()).to(out_dt)
         else:
             raise NotImplementedError(f"exl3 grouped: activation {act}")
-        # down projection consumes mid in the Hadamard domain per expert
-        for i in range(E):
-            s0 = int(offsets_cpu[i].item())
-            c = int(counts_cpu[i].item())
-            if c <= 0:
-                continue
-            suh_i = packed["down_suh_keep"][i]
-            xh = torch.empty(mid[s0:s0 + c].shape, dtype=torch.float16,
-                             device=dev)
-            torch.ops.sgl_kernel.sgl_exl3_had_in(
-                mid[s0:s0 + c].contiguous(), suh_i, xh)
-            mid[s0:s0 + c] = xh
-        # The down projection's pair rows reach the combine; rows for pairs
-        # the kernel did not process (zero-count experts, remote/sentinel
-        # pairs) are unwritten uninitialized memory — allocate zeros for THIS
-        # projection and copy the processed ranges out of the kernel's output.
-        o_d_raw = grouped_gemm(mid, "down", packed["down_n"], 4)
-        o_d = torch.zeros_like(o_d_raw)
-        off_cpu = 0
-        for i in range(E + 1):
-            c = int(counts_cpu[i].item())
-            if c > 0:
-                o_d[off_cpu:off_cpu + c] = o_d_raw[off_cpu:off_cpu + c]
-            off_cpu += c
-
+        # Down projection consumes mid in the Hadamard domain per expert —
+        # same single-launch grouped transform (down owns its suh).
+        mid_t = torch.empty_like(mid)
+        torch.ops.sgl_exl3_grouped.grouped_had_in(
+            mid, packed["down_suh_ptrs_dev"], counts, offsets, 64, mid_t)
+        mid = mid_t        # Down projection: pair rows reach the combine. Output pre-zeroed so
+        # rows the kernel did not process (zero-count experts, overflow,
+        # sentinel) contribute nothing — no CPU-side staging needed.
+        o_d = grouped_gemm(mid, "down", packed["down_n"], 4, zero_init=True)
         out = torch.zeros((x.shape[0], packed["down_n"]),
                           dtype=torch.float32, device=dev)
         out.index_add_(0, tok, o_d.float() * pw[:, None])
