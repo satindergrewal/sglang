@@ -8,6 +8,7 @@ mod = load(
     sources=[
         f'{ROOT}/csrc/exl3/exl3_linear.cu',
         f'{ROOT}/csrc/exl3/exl3_grouped.cu',
+        f'{ROOT}/csrc/exl3/exl3_grouped_had.cu',
         f'{ROOT}/csrc/exl3/exl3_ops_reg.cc',
     ],
     extra_include_paths=[f'{ROOT}/csrc', f'{ROOT}/include'],

@@ -61,6 +61,10 @@ def _ptr_arrays(proj):
     packed[f'{proj}_half_k'] = 1 if mat[1].shape[2] % 16 else 0
     packed[f'{proj}_cb'] = 2
     packed[f'{proj}_suh_keep'] = [m[2] for m in packed[proj]]
+    su_dev = torch.zeros(n_exp + 1, dtype=torch.int64, device=dev)
+    for i, m_ in enumerate(packed[proj]):
+        su_dev[i] = m_[2].data_ptr()
+    packed[f'{proj}_suh_ptrs_dev'] = su_dev
     packed[f'{proj}_n_out'] = v_.shape[0]
 for proj in ('gate', 'up', 'down'):
     _ptr_arrays(proj)
