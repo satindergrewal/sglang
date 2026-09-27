@@ -1135,6 +1135,10 @@ class FlashInferAttnBackend(AttentionBackend):
                         forward_batch.req_pool_indices.cpu().tolist(),
                         seq_lens_cpu_v,
                         self.sliding_window_size,
+                        # Verify has no ragged side: the b-side rows cover
+                        # the full window including the newest draft tokens
+                        # (saved into the pool before attention).
+                        include_last_token=True,
                     )
                 )
             self.indices_updater_prefill.update(
@@ -1496,6 +1500,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # We perform dequant for chunk prefill/cache reuse.
         pool = self.token_to_kv_pool
+        kv_saved_early = False
         if self.prefill_uses_dequant_workspace:
             # Decode-as-extend: SWA layers read the b-side workspace (filled
             # from the SWA pool during metadata prep; no re-preparation).
@@ -1515,21 +1520,22 @@ class FlashInferAttnBackend(AttentionBackend):
             prefix_lens_cpu_w = forward_batch.extend_prefix_lens_cpu
             extend_lens_cpu_w = forward_batch.extend_seq_lens_cpu
             k_cur_w, v_cur_w = k, v
+            kv_saved_early = False
             if forward_batch.forward_mode.is_target_verify():
                 # Verify batches never populate the CPU extend mirrors: the
-                # "extend chunk" is the draft tokens (uniform per request,
-                # already written into the pool layout by the paged save
-                # below) and the prefix is the committed sequence.
-                num_draft = getattr(forward_batch.spec_info, "num_tokens_per_req", None)
-                if num_draft is None:
-                    num_draft = forward_batch.extend_seq_lens
-                    num_draft = (
-                        int(num_draft[0].item())
-                        if num_draft is not None and num_draft.numel() > 0
-                        else 1
+                # whole sequence (committed prefix + draft tokens) must come
+                # out of the pool. Save the draft K/V FIRST so the per-layer
+                # dequant below reads fresh data for the draft region too.
+                if k is not None and save_kv_cache:
+                    assert v is not None
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        *self._kv_write_scales(layer),
                     )
-                else:
-                    num_draft = int(num_draft)
+                    kv_saved_early = True
                 seq_lens_cpu_w = forward_batch.seq_lens_cpu
                 if seq_lens_cpu_w is None:
                     seq_lens_cpu_w = forward_batch.seq_lens.cpu().tolist()
@@ -1537,8 +1543,9 @@ class FlashInferAttnBackend(AttentionBackend):
                     int(s) if not isinstance(s, torch.Tensor) else int(s.item())
                     for s in seq_lens_cpu_w
                 ]
-                prefix_lens_cpu_w = [s - num_draft for s in seq_lens_cpu_w]
-                extend_lens_cpu_w = [num_draft] * forward_batch.batch_size
+                prefix_lens_cpu_w = seq_lens_cpu_w
+                extend_lens_cpu_w = [0] * forward_batch.batch_size
+                k_cur_w, v_cur_w = None, None
             kv_cache = pool.get_flashinfer_dequant_workspace_kv_buffer(
                 layer,
                 self.req_to_token_pool.req_to_token,
@@ -1559,7 +1566,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # use paged attention
         if not self.forward_metadata.use_ragged:
-            if k is not None and save_kv_cache:
+            if k is not None and save_kv_cache and not kv_saved_early:
                 assert v is not None
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
@@ -2541,7 +2548,34 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask = cross_attention_custom_mask
         else:
             assert isinstance(spec_info, SpecInput)
-            if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
+            force_plain_plan = False
+            if (
+                custom_kv_indices is not None
+                and self.attn_backend.dq_paged_kernel_lens is not None
+            ):
+                # NVFP4 target-verify: plan over the FP8 dequant workspace
+                # rows, not the packed-FP4 pool page table. The per-wrapper
+                # dq table and lens were swapped in by update_sliding_window
+                # (a-side full / b-side window-trimmed); the queries are the
+                # uniform draft tokens, so qo_indptr steps by
+                # num_tokens_per_req.
+                kv_indices = custom_kv_indices
+                kv_indptr[1 : bs + 1] = torch.cumsum(
+                    self.attn_backend.dq_paged_kernel_lens, dim=0
+                )
+                kv_indptr = kv_indptr[: bs + 1]
+                ntr = int(spec_info.num_tokens_per_req)
+                qo_indptr[1 : bs + 1] = torch.arange(
+                    ntr,
+                    (bs + 1) * ntr,
+                    step=ntr,
+                    dtype=qo_indptr.dtype,
+                    device=qo_indptr.device,
+                )
+                qo_indptr = qo_indptr[: bs + 1]
+                custom_mask = None
+                force_plain_plan = True
+            elif spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
                         req_pool_indices,
@@ -2613,7 +2647,8 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info.num_tokens_per_req if spec_info is not None else None
         )
         uses_fast_prefill = (
-            hasattr(wrapper_paged.begin_forward, "func")
+            not force_plain_plan
+            and hasattr(wrapper_paged.begin_forward, "func")
             and wrapper_paged.begin_forward.func is fast_prefill_plan
         )
         if uses_fast_prefill:

@@ -275,6 +275,7 @@ class SWAKVPool(BaseSWAKVPool):
         req_pool_indices_cpu,
         seq_lens_cpu,
         sliding_window_size: int,
+        include_last_token: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build the b-side decode-as-extend gather plan and page table.
 
@@ -284,6 +285,11 @@ class SWAKVPool(BaseSWAKVPool):
         once per decode step here and stashed on the SWA inner pool; the
         per-layer FP4 -> FP8 fill happens in the b-side workspace getter, the
         same per-layer contract the a-side workspace follows.
+
+        Target-verify passes include_last_token=True: there is no ragged
+        side, the draft K/V are saved into the pool before attention, and
+        the b-side rows must cover the full window including the newest
+        tokens.
 
         Returns (page_table, kv_lens) for the SWA paged plan.
         """
@@ -296,10 +302,11 @@ class SWAKVPool(BaseSWAKVPool):
         for i in range(len(req_pool_indices_cpu)):
             req_idx = int(req_pool_indices_cpu[i])
             seq_len = int(seq_lens_cpu[i])
-            keep = min(seq_len - 1, sliding_window_size)
+            end = seq_len if include_last_token else seq_len - 1
+            keep = min(end, sliding_window_size)
             if keep > 0:
-                start = seq_len - 1 - keep
-                locs = req_to_token[req_idx, start : seq_len - 1]
+                start = end - keep
+                locs = req_to_token[req_idx, start:end]
                 locs = self.translate_loc_from_full_to_swa(locs)
                 locs_parts.append(locs)
                 valid_parts.append(locs >= 0)
