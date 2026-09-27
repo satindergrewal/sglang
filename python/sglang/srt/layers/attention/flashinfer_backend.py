@@ -358,6 +358,8 @@ class FlashInferAttnBackend(AttentionBackend):
         )
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
+        self.dq_full_paged_kernel_lens = None
+        self.dq_swa_page_table = None
         self.cpu_req_pool_indices = None
         # FP4 fake-quant prefill/decode exposes an FP8 workspace to FlashInfer.
         self.flashinfer_kv_cache_dtype = (
@@ -940,6 +942,12 @@ class FlashInferAttnBackend(AttentionBackend):
             and (
                 forward_batch.forward_mode.is_extend_without_speculative()
                 or is_decode_as_extend_step
+                # EAGLE/DFlash target-verify: the verify batch reads the FULL
+                # sequence (committed prefix + freshly-written draft tokens)
+                # through the FP8 dequant workspace — same as non-ragged
+                # prefill. Without this prep the wrapper plans over the raw
+                # packed-FP4 pool and every verify read is garbage.
+                or forward_batch.forward_mode.is_target_verify()
             )
         ):
             return
@@ -1021,6 +1029,7 @@ class FlashInferAttnBackend(AttentionBackend):
         return layer.k_scale, layer.v_scale
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        self._in_target_verify = False
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             swa_out_cache_loc = self.kv_index_translator.sliding_window_write_loc_for(
@@ -1102,6 +1111,32 @@ class FlashInferAttnBackend(AttentionBackend):
                 swa_out_cache_loc=swa_out_cache_loc,
             )
         elif forward_batch.forward_mode.is_target_verify():
+            self._in_target_verify = True
+            # NVFP4 KV: the verify wrappers must plan over the FP8 dequant
+            # workspace covering the FULL sequence (committed prefix + the
+            # draft tokens whose KV is written to the pool before attention).
+            # a-side = full pool; b-side = SWA pool (translated + window-
+            # trimmed), same dual-wrapper contract as decode-as-extend.
+            self._prepare_dequant_workspace_metadata_for_extend(
+                forward_batch, False
+            )
+            if (
+                self.prefill_uses_dequant_workspace
+                and self.token_to_kv_pool.__class__.__name__ == "SWAKVPool"
+            ):
+                seq_lens_cpu_v = (
+                    forward_batch.seq_lens_cpu
+                    if forward_batch.seq_lens_cpu is not None
+                    else forward_batch.seq_lens.cpu().tolist()
+                )
+                self.dq_swa_page_table, self.dq_swa_paged_kernel_lens = (
+                    self.token_to_kv_pool.prepare_swa_dequant_workspace(
+                        self.req_to_token_pool.req_to_token,
+                        forward_batch.req_pool_indices.cpu().tolist(),
+                        seq_lens_cpu_v,
+                        self.sliding_window_size,
+                    )
+                )
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -1112,6 +1147,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
+                custom_kv_indices=self.dq_page_table,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_verify,
@@ -1463,25 +1499,59 @@ class FlashInferAttnBackend(AttentionBackend):
         if self.prefill_uses_dequant_workspace:
             # Decode-as-extend: SWA layers read the b-side workspace (filled
             # from the SWA pool during metadata prep; no re-preparation).
+            # Target-verify follows the same dual-workspace contract: SWA
+            # layers read the window-trimmed b-side, full layers the a-side.
             layer_is_swa = (
-                getattr(self, "decode_as_extend", False)
-                and forward_batch.forward_mode.is_decode_or_idle()
+                (
+                    (
+                        getattr(self, "decode_as_extend", False)
+                        and forward_batch.forward_mode.is_decode_or_idle()
+                    )
+                    or forward_batch.forward_mode.is_target_verify()
+                )
                 and layer.sliding_window_size is not None
                 and layer.sliding_window_size != -1
             )
+            prefix_lens_cpu_w = forward_batch.extend_prefix_lens_cpu
+            extend_lens_cpu_w = forward_batch.extend_seq_lens_cpu
+            k_cur_w, v_cur_w = k, v
+            if forward_batch.forward_mode.is_target_verify():
+                # Verify batches never populate the CPU extend mirrors: the
+                # "extend chunk" is the draft tokens (uniform per request,
+                # already written into the pool layout by the paged save
+                # below) and the prefix is the committed sequence.
+                num_draft = getattr(forward_batch.spec_info, "num_tokens_per_req", None)
+                if num_draft is None:
+                    num_draft = forward_batch.extend_seq_lens
+                    num_draft = (
+                        int(num_draft[0].item())
+                        if num_draft is not None and num_draft.numel() > 0
+                        else 1
+                    )
+                else:
+                    num_draft = int(num_draft)
+                seq_lens_cpu_w = forward_batch.seq_lens_cpu
+                if seq_lens_cpu_w is None:
+                    seq_lens_cpu_w = forward_batch.seq_lens.cpu().tolist()
+                seq_lens_cpu_w = [
+                    int(s) if not isinstance(s, torch.Tensor) else int(s.item())
+                    for s in seq_lens_cpu_w
+                ]
+                prefix_lens_cpu_w = [s - num_draft for s in seq_lens_cpu_w]
+                extend_lens_cpu_w = [num_draft] * forward_batch.batch_size
             kv_cache = pool.get_flashinfer_dequant_workspace_kv_buffer(
                 layer,
                 self.req_to_token_pool.req_to_token,
                 self.cpu_req_pool_indices,
-                forward_batch.extend_prefix_lens_cpu,
-                forward_batch.extend_seq_lens_cpu,
+                prefix_lens_cpu_w,
+                extend_lens_cpu_w,
                 self.page_size,
                 prepare_workspace=(
                     self.dq_page_table is not None and not layer_is_swa
                 ),
                 use_ragged=self.forward_metadata.use_ragged,
-                k_cur=k,
-                v_cur=v,
+                k_cur=k_cur_w,
+                v_cur=v_cur_w,
                 use_b_side=layer_is_swa,
             )
         else:
@@ -2187,14 +2257,24 @@ class FlashInferIndicesUpdaterPrefill:
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
     ):
-        if custom_kv_indices is not None and not self.attn_backend.decode_as_extend:
+        if (
+            custom_kv_indices is not None
+            and not self.attn_backend.decode_as_extend
+            # Target-verify dual-wrapper path: SWA wrapper reads the b-side
+            # (window-trimmed) workspace, full wrapper the a-side — prepared
+            # by the verify branch of init_forward_metadata.
+            and not getattr(self.attn_backend, "_in_target_verify", False)
+        ):
             raise RuntimeError(
                 "NVFP4 custom KV indices are only supported by the single-wrapper FlashInfer path."
             )
         custom_kv_indices_swa = (
             self.attn_backend.dq_swa_page_table
             if custom_kv_indices is not None
-            and self.attn_backend.decode_as_extend
+            and (
+                self.attn_backend.decode_as_extend
+                or getattr(self.attn_backend, "_in_target_verify", False)
+            )
             and self.attn_backend.dq_swa_page_table is not None
             else None
         )
