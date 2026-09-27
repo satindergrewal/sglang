@@ -2503,6 +2503,7 @@ class FlashInferIndicesUpdaterPrefill:
         window_left: int = -1,
     ):
         bs = len(seq_lens)
+        force_plain_plan = False
         # Unified SWA wrapper-0: gather from the swa canonical directly -- its
         # entries are already swa-side kernel-facing ids, so the in-place
         # full->swa translate below must not run on top of them.
@@ -2548,7 +2549,6 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask = cross_attention_custom_mask
         else:
             assert isinstance(spec_info, SpecInput)
-            force_plain_plan = False
             if (
                 custom_kv_indices is not None
                 and self.attn_backend.dq_paged_kernel_lens is not None
