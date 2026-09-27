@@ -81,6 +81,9 @@ for bs in (1, 2, 4, 8):
     x = torch.randn(T, H, device=dev).half()
     if os.environ.get('ONE_EXPERT') == '1':
         ids = torch.zeros(T, slots, device=dev, dtype=torch.int32)
+    elif os.environ.get('REMOTE_PAIRS') == '1':
+        ids = torch.randint(0, E, (T, slots), device=dev, dtype=torch.int32)
+        ids[:, ::2] = -1  # half the pairs remote (sentinel)
     else:
         ids = torch.randint(0, E, (T, slots), device=dev, dtype=torch.int32)
     wts = torch.rand(T, slots, device=dev, dtype=torch.float32)
@@ -91,8 +94,9 @@ for bs in (1, 2, 4, 8):
     w_ref = wts.reshape(-1)
     ref = torch.zeros(T, packed['down_n'], device=dev, dtype=torch.float32)
     cache = {}
+    real = flat >= 0
     for i in range(E):
-        idx = (flat == i).nonzero(as_tuple=True)[0]
+        idx = ((flat == i) & real).nonzero(as_tuple=True)[0]
         if idx.numel() == 0:
             continue
         rows = idx // slots
