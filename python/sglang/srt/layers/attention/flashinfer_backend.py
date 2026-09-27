@@ -971,6 +971,13 @@ class FlashInferAttnBackend(AttentionBackend):
             int(seq_len.item()) if isinstance(seq_len, torch.Tensor) else int(seq_len)
             for seq_len in raw_paged_seq_lens
         ]
+        if forward_batch.forward_mode.is_target_verify():
+            # Verify seq_lens count the COMMITTED tokens only; the draft
+            # tokens attend over committed + draft (their pool slots are
+            # already in req_to_token). The workspace must cover all of it
+            # or every causal offset shifts by the draft count.
+            ntr_v = int(forward_batch.spec_info.num_tokens_per_req)
+            paged_seq_lens = [s + ntr_v for s in paged_seq_lens]
         # The workspace holds one row per live token; capture-time dummies can
         # fabricate batches (bs x max_seq) larger than the token pool, which
         # would plan attention past the workspace. Fail loudly instead.
@@ -1129,6 +1136,12 @@ class FlashInferAttnBackend(AttentionBackend):
                     if forward_batch.seq_lens_cpu is not None
                     else forward_batch.seq_lens.cpu().tolist()
                 )
+                seq_lens_cpu_v = [
+                    int(s) if not isinstance(s, torch.Tensor) else int(s.item())
+                    for s in seq_lens_cpu_v
+                ]
+                ntr_swa = int(forward_batch.spec_info.num_tokens_per_req)
+                seq_lens_cpu_v = [s + ntr_swa for s in seq_lens_cpu_v]
                 self.dq_swa_page_table, self.dq_swa_paged_kernel_lens = (
                     self.token_to_kv_pool.prepare_swa_dequant_workspace(
                         self.req_to_token_pool.req_to_token,
@@ -1140,6 +1153,18 @@ class FlashInferAttnBackend(AttentionBackend):
                         # (saved into the pool before attention).
                         include_last_token=True,
                     )
+                )
+            import os as _os
+            if _os.environ.get("SGLANG_DEBUG_VERIFY_DQ"):
+                _sl = seq_lens_cpu_v if seq_lens_cpu_v is not None else forward_batch.seq_lens.tolist()
+                logger.warning(
+                    "[VERIFY-DQ] bs=%d seq_lens=%s dq_full=%s dq_swa=%s pt_len=%s swa_pt_len=%s",
+                    forward_batch.batch_size,
+                    _sl if not isinstance(_sl, list) else _sl[:8],
+                    self.dq_full_paged_kernel_lens.tolist()[:8] if self.dq_full_paged_kernel_lens is not None else None,
+                    self.dq_swa_paged_kernel_lens.tolist()[:8] if self.dq_swa_paged_kernel_lens is not None else None,
+                    self.dq_page_table.numel() if self.dq_page_table is not None else None,
+                    self.dq_swa_page_table.numel() if self.dq_swa_page_table is not None else None,
                 )
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -1543,9 +1568,20 @@ class FlashInferAttnBackend(AttentionBackend):
                     int(s) if not isinstance(s, torch.Tensor) else int(s.item())
                     for s in seq_lens_cpu_w
                 ]
-                prefix_lens_cpu_w = seq_lens_cpu_w
+                # Coverage = committed + draft: the draft tokens' slots are
+                # in req_to_token and their K/V were saved into the pool
+                # above, so the full verify length dequants from the pool.
+                ntr_fe = int(forward_batch.spec_info.num_tokens_per_req)
+                prefix_lens_cpu_w = [s + ntr_fe for s in seq_lens_cpu_w]
                 extend_lens_cpu_w = [0] * forward_batch.batch_size
                 k_cur_w, v_cur_w = None, None
+                import os as _os
+                if _os.environ.get("SGLANG_DEBUG_VERIFY_DQ"):
+                    logger.warning(
+                        "[VERIFY-FE] layer=%d swa=%s prefix=%s extend=%s ws_prepared=%s",
+                        layer.layer_id, layer_is_swa, prefix_lens_cpu_w[:8],
+                        extend_lens_cpu_w[:8], self.dq_page_table is not None,
+                    )
             kv_cache = pool.get_flashinfer_dequant_workspace_kv_buffer(
                 layer,
                 self.req_to_token_pool.req_to_token,
@@ -2565,6 +2601,24 @@ class FlashInferIndicesUpdaterPrefill:
                 )
                 kv_indptr = kv_indptr[: bs + 1]
                 ntr = int(spec_info.num_tokens_per_req)
+                import os as _os
+                if _os.environ.get("SGLANG_DEBUG_VERIFY_DQ"):
+                    _ref = spec_info.generate_attn_arg_prefill(
+                        req_pool_indices, paged_kernel_lens, paged_kernel_lens_sum,
+                        self.req_to_token,
+                    )
+                    logger.warning(
+                        "[VERIFY-PLAN] bs=%d ntr=%d my_qo=%s ref_qo=%s my_kv_ip=%s ref_kv_ip=%s my_kv0=%s ref_kv0=%s dqlens=%s pagedlens=%s",
+                        bs, ntr,
+                        qo_indptr[:9].tolist(),
+                        _ref[2][:9].tolist() if _ref[2] is not None else None,
+                        kv_indptr[:9].tolist(),
+                        _ref[1][:9].tolist() if _ref[1] is not None else None,
+                        kv_indices[:8].tolist(),
+                        _ref[0][:8].tolist() if _ref[0] is not None else None,
+                        self.attn_backend.dq_paged_kernel_lens.tolist()[:8],
+                        paged_kernel_lens.tolist()[:8] if paged_kernel_lens is not None else None,
+                    )
                 qo_indptr[1 : bs + 1] = torch.arange(
                     ntr,
                     (bs + 1) * ntr,
