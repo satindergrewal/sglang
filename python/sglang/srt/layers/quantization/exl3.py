@@ -370,6 +370,11 @@ try:
     _HAS_HAD_IN_PAIRS = hasattr(torch.ops.sgl_exl3_grouped, "grouped_had_in_pairs")
 except (AttributeError, RuntimeError):
     _HAS_HAD_IN_PAIRS = False
+
+try:
+    _HAS_FUSED_ROUTE = hasattr(torch.ops.sgl_exl3_grouped, "route_sort")
+except (AttributeError, RuntimeError):
+    _HAS_FUSED_ROUTE = False
 _SHARD_NAME_TO_INDEX = {"q": 0, "k": 1, "v": 2}
 _PARAM_DTYPES = {
     "trellis": torch.int16,
@@ -1218,42 +1223,69 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         exceeds the kernel's per-pass capacity; the caller falls back to the
         python-loop path (correct, slower)."""
         K = ids.shape[-1]
-        flat = ids.reshape(-1).to(torch.long)
-        key = torch.where(flat >= 0, flat, torch.full_like(flat, E))
-        order = torch.argsort(key, stable=True)
-        sids = key[order]
-        tok = order // K
-        pw = wts.reshape(-1)[order].float()
+        P = ids.numel()
         comp = getattr(self, "_interm_comp", 1.0) or 1.0
-        if comp != 1.0:
-            pw = pw * comp
         rsf = runner_config.routed_scaling_factor
-        if rsf is not None:
-            pw = pw * rsf
-        counts = torch.histc(sids.float(), bins=E, min=0, max=E - 1).to(torch.int32)
-        # Sentinel slot appended as a device-side zero (no H2D scalar copy —
-        # `counts[E] = 0` would be an index_put with a CPU scalar, which is
-        # illegal inside CUDA graph capture).
-        counts = torch.cat(
-            [counts, torch.zeros(1, dtype=torch.int32, device=counts.device)]
-        )
-        offsets = torch.zeros(E + 2, dtype=torch.int64, device=x.device)
-        offsets[1:] = counts.cumsum(0).to(torch.int64)
-        x_pairs = x[tok].contiguous()
-        # Fully device-side: no D2H syncs in this path (CUDA-graph-safe).
-        # The sentinel count is zeroed on the GPU tensor the kernel reads.
-        # The sentinel slot E (remote pairs) has NULL pointer entries in the
-        # arrays — zero its count so the kernel never dereferences slot E,
-        # and zero the remote pairs' weights so their (unprocessed) output
-        # rows contribute nothing at the combine. The mask must follow the
-        # SORTED order (pw is wts[order]); sids == key[order].
-        pw = torch.where(sids < E, pw, torch.zeros_like(pw))
-        if (not torch.cuda.is_current_stream_capturing()
-                and int(counts[:E].max().item()) > 16 * 4):
-            raise MoEGroupedOverflow()
-
-        CH = 4
+        wscale = comp * (rsf if rsf is not None else 1.0)
         dev = x.device
+        if _HAS_FUSED_ROUTE and P <= 512:
+            # Two-launch fused routing (single-block bitonic sort + gather
+            # grid). Replaces ~10 tiny torch kernels (~80us of launch
+            # overhead at decode sizes) with ~12us. The fused sort is not
+            # stable, which is fine: pair rows within an expert segment may
+            # permute freely — tok/pw follow the same permutation.
+            sids = torch.empty(P, dtype=torch.int32, device=dev)
+            order = torch.empty(P, dtype=torch.int32, device=dev)
+            tok = torch.empty(P, dtype=torch.int32, device=dev)
+            counts = torch.zeros(E + 1, dtype=torch.int32, device=dev)
+            offsets = torch.zeros(E + 2, dtype=torch.int64, device=dev)
+            torch.ops.sgl_exl3_grouped.route_sort(
+                ids.reshape(-1).to(torch.int32).contiguous(),
+                E, K, sids, order, tok, counts, offsets)
+            x_pairs = torch.empty(P, x.shape[1], dtype=x.dtype, device=dev)
+            pw = torch.empty(P, dtype=torch.float32, device=dev)
+            torch.ops.sgl_exl3_grouped.route_gather(
+                x, order, tok, sids,
+                wts.reshape(-1).to(torch.float32).contiguous(),
+                E, K, wscale, x_pairs, pw)
+            if (not torch.cuda.is_current_stream_capturing()
+                    and int(counts[:E].max().item()) > 16 * 4):
+                raise MoEGroupedOverflow()
+            CH = 4
+        else:
+            flat = ids.reshape(-1).to(torch.long)
+            key = torch.where(flat >= 0, flat, torch.full_like(flat, E))
+            order = torch.argsort(key, stable=True)
+            sids = key[order]
+            tok = order // K
+            pw = wts.reshape(-1)[order].float()
+            if comp != 1.0:
+                pw = pw * comp
+            if rsf is not None:
+                pw = pw * rsf
+            counts = torch.histc(sids.float(), bins=E, min=0, max=E - 1).to(torch.int32)
+            # Sentinel slot appended as a device-side zero (no H2D scalar copy —
+            # `counts[E] = 0` would be an index_put with a CPU scalar, which is
+            # illegal inside CUDA graph capture).
+            counts = torch.cat(
+                [counts, torch.zeros(1, dtype=torch.int32, device=counts.device)]
+            )
+            offsets = torch.zeros(E + 2, dtype=torch.int64, device=x.device)
+            offsets[1:] = counts.cumsum(0).to(torch.int64)
+            x_pairs = x[tok].contiguous()
+            # Fully device-side: no D2H syncs in this path (CUDA-graph-safe).
+            # The sentinel count is zeroed on the GPU tensor the kernel reads.
+            # The sentinel slot E (remote pairs) has NULL pointer entries in the
+            # arrays — zero its count so the kernel never dereferences slot E,
+            # and zero the remote pairs' weights so their (unprocessed) output
+            # rows contribute nothing at the combine. The mask must follow the
+            # SORTED order (pw is wts[order]); sids == key[order].
+            pw = torch.where(sids < E, pw, torch.zeros_like(pw))
+            if (not torch.cuda.is_current_stream_capturing()
+                    and int(counts[:E].max().item()) > 16 * 4):
+                raise MoEGroupedOverflow()
+
+            CH = 4
         # Persistent per-layer workspace/counters (fixed shapes): avoids
         # several GB of alloc/free per pass; zeros are restored in-kernel.
         ws_cache = getattr(self, "_grouped_ws", None)
@@ -1343,7 +1375,7 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         o_d = grouped_gemm(mid, "down", packed["down_n"], 4, zero_init=True)
         out = torch.zeros((x.shape[0], packed["down_n"]),
                           dtype=torch.float32, device=dev)
-        out.index_add_(0, tok, o_d.float() * pw[:, None])
+        out.index_add_(0, tok, o_d.float() * pw[:, None].to(out.dtype))
         if _probe:
             cos = torch.nn.functional.cosine_similarity(
                 o_d[: ref.shape[0]].float(), ref, dim=0).item()
