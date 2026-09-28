@@ -1228,7 +1228,7 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         rsf = runner_config.routed_scaling_factor
         wscale = comp * (rsf if rsf is not None else 1.0)
         dev = x.device
-        if _HAS_FUSED_ROUTE and P <= 512:
+        if _HAS_FUSED_ROUTE and P <= 512 and os.environ.get("EXL3_MOE_NO_FUSED_ROUTE") != "1":
             # Two-launch fused routing (single-block bitonic sort + gather
             # grid). Replaces ~10 tiny torch kernels (~80us of launch
             # overhead at decode sizes) with ~12us. The fused sort is not
