@@ -988,7 +988,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # tokens attend over committed + draft (their pool slots are
             # already in req_to_token). The workspace must cover all of it
             # or every causal offset shifts by the draft count.
-            ntr_v = int(forward_batch.spec_info.num_tokens_per_req)
+            ntr_v = self._verify_draft_count(forward_batch.spec_info)
             paged_seq_lens = [s + ntr_v for s in paged_seq_lens]
         # The workspace holds one row per live token; capture-time dummies can
         # fabricate batches (bs x max_seq) larger than the token pool, which
@@ -1044,6 +1044,15 @@ class FlashInferAttnBackend(AttentionBackend):
         self.cpu_req_pool_indices = forward_batch.req_pool_indices.to(
             "cpu", non_blocking=True
         )
+
+    @staticmethod
+    def _verify_draft_count(spec_info) -> int:
+        # EAGLE verify carries num_tokens_per_req; DFLASH verify carries
+        # draft_token_num (num_tokens_per_req is 0/absent there).
+        n = getattr(spec_info, "num_tokens_per_req", None)
+        if not n:
+            n = getattr(spec_info, "draft_token_num", None)
+        return int(n) if n else 1
 
     def _kv_write_scales(self, layer: RadixAttention):
         if self.kv_cache_quant_method.needs_global_scale():
@@ -1134,6 +1143,8 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         elif forward_batch.forward_mode.is_target_verify():
             self._in_target_verify = True
+            seq_lens_cpu_v = None
+            ntr_swa = 0
             # NVFP4 KV: the verify wrappers must plan over the FP8 dequant
             # workspace covering the FULL sequence (committed prefix + the
             # draft tokens whose KV is written to the pool before attention).
@@ -1155,7 +1166,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     int(s) if not isinstance(s, torch.Tensor) else int(s.item())
                     for s in seq_lens_cpu_v
                 ]
-                ntr_swa = int(forward_batch.spec_info.num_tokens_per_req)
+                ntr_swa = self._verify_draft_count(forward_batch.spec_info)
                 seq_lens_cpu_v = [s + ntr_swa for s in seq_lens_cpu_v]
                 self.dq_swa_page_table, self.dq_swa_paged_kernel_lens = (
                     self.token_to_kv_pool.prepare_swa_dequant_workspace(
@@ -1592,7 +1603,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 # Coverage = committed + draft: the draft tokens' slots are
                 # in req_to_token and their K/V were saved into the pool
                 # above, so the full verify length dequants from the pool.
-                ntr_fe = int(forward_batch.spec_info.num_tokens_per_req)
+                ntr_fe = self._verify_draft_count(forward_batch.spec_info)
                 prefix_lens_cpu_w = [s + ntr_fe for s in seq_lens_cpu_w]
                 extend_lens_cpu_w = [0] * forward_batch.batch_size
                 k_cur_w, v_cur_w = None, None
