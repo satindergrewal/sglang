@@ -1331,7 +1331,7 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         import os as _os
         _probe = (
             _os.environ.get("EXL3_MOE_PROBE") == "1"
-            and getattr(self, "_probe_layer", None) == 1
+            and getattr(self, "_probe_layer", None) == int(os.environ.get("EXL3_MOE_PROBE_LAYER", "1"))
             and not getattr(self, "_probe_done", False)
         )
         act = runner_config.activation
