@@ -1304,7 +1304,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
 
         vision_config = getattr(config, "vision_config", None)
         audio_config = getattr(config, "audio_config", None)
-        self._is_multimodal = vision_config is not None and audio_config is not None
+        # Empty-dict configs mean the towers were stripped (trimmed
+        # checkpoints); only non-empty configs count as multimodal.
+        self._is_multimodal = bool(vision_config) and bool(audio_config)
         # Text-only opt-out (e.g. --json-model-override-args
         # '{"enable_multimodal": false}'): skip the vision/audio encoders
         # entirely so a language-only deployment needs no ffmpeg/torchcodec
