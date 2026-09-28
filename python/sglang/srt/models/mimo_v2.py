@@ -471,9 +471,11 @@ class MiMoV2MoE(nn.Module):
             # is declared by the converter in quantization_config
             # ("interm_comp_last_layer"); legacy artifacts predate the flag and
             # were divided, so the default stays 128.
+            _qcfg = quant_config if isinstance(quant_config, dict) else (
+                getattr(quant_config, "_config_dict", None) or {})
             self.experts.interm_comp = float(
-                quant_config.get("interm_comp_last_layer", 128.0)
-            )
+                _qcfg.get("interm_comp_last_layer", 128.0)
+                if isinstance(_qcfg, dict) else 128.0)
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
