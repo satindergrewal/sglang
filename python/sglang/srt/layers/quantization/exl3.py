@@ -1340,21 +1340,19 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             # construction, inside the serve).
             ref = torch.zeros((x.shape[0], packed["down_n"]),
                               dtype=torch.float32, device=dev)
-            counts_cpu = counts.cpu(); counts_cpu[E] = 0
-            offsets_cpu = offsets.cpu()
-            tok_cpu = tok.cpu() if torch.is_tensor(tok) else None
+            counts_l = counts.tolist()
+            offsets_l = offsets.tolist()
             for i in range(E):
-                s0 = int(offsets_cpu[i].item()); c = int(counts_cpu[i].item())
+                s0 = int(offsets_l[i]); c = int(counts_l[i])
                 if c <= 0: continue
                 ge = packed["gate"][i]; ue = packed["up"][i]; de = packed["down"][i]
-                rows = (tok_cpu[s0:s0+c] if tok_cpu is not None
-                        else (order[s0:s0+c].cpu() // ids.shape[-1]))
+                rows = tok[s0:s0+c]
                 xe = x[rows]
                 ge_d = dequant_matrix_orig(ge[1], ge[2], ge[3], "mul1").float()
                 ue_d = dequant_matrix_orig(ue[1], ue[2], ue[3], "mul1").float()
                 de_d = dequant_matrix_orig(de[1], de[2], de[3], "mul1").float()
                 m_r = (F.silu(xe.float() @ ge_d) * (xe.float() @ ue_d)) @ de_d
-                ref.index_add_(0, rows.cpu(), m_r * pw[s0:s0+c].float()[:, None].cpu())
+                ref.index_add_(0, rows, m_r * pw[s0:s0+c].float()[:, None])
             cos = torch.nn.functional.cosine_similarity(
                 out.float().flatten(), ref.flatten(), dim=0).item()
             print(f"MOEPROBE full-pipeline cos {cos:.6f} "
