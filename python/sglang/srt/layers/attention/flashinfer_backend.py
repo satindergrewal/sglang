@@ -384,6 +384,11 @@ class FlashInferAttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
+        # Draft runners (EAGLE nextn) are language-only: never force the
+        # paged/workspace path on them via the multimodal rule. The ragged
+        # extend branch is the proven draft path; the paged path over a draft
+        # pool spins the sinks/LSE kernel on long extends.
+        self._draft_force_ragged = bool(getattr(model_runner, "is_draft_worker", False))
         # Decode-as-extend b-side prep needs the SWA window size; the indices
         # updaters keep their own copy, the backend never did.
         self.sliding_window_size = model_runner.sliding_window_size
@@ -937,6 +942,7 @@ class FlashInferAttnBackend(AttentionBackend):
             self.decode_as_extend
             and forward_batch.forward_mode.is_decode_or_idle()
         )
+        fm = forward_batch.forward_mode
         if not (
             self.prefill_uses_dequant_workspace
             and (
@@ -947,7 +953,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 # through the FP8 dequant workspace — same as non-ragged
                 # prefill. Without this prep the wrapper plans over the raw
                 # packed-FP4 pool and every verify read is garbage.
-                or forward_batch.forward_mode.is_target_verify()
+                or fm.is_target_verify()
+                # Draft extend (EAGLE nextn ingest) runs through the paged
+                # wrapper too; without the prep it plans a zero-length KV
+                # and the sinks/LSE paged kernel spins on its split counters.
+                or getattr(fm, "is_draft_extend_v2", lambda: False)()
+                or fm.name == "DRAFT_EXTEND"
             )
         ):
             return
@@ -1188,7 +1199,12 @@ class FlashInferAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens
 
             # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
-            if self.is_multimodal or self.enable_mis:
+            if self._draft_force_ragged:
+                use_ragged = True
+                extend_no_prefix = not any(
+                    forward_batch.extend_prefix_lens_cpu or []
+                )
+            elif self.is_multimodal or self.enable_mis:
                 # use_ragged = False: Multi-item scoring requires the paged wrapper because:
                 # 1. Ragged wrapper doesn't support the specialized multi-item parameters
                 #    (prefix_len_ptr, token_pos_in_items_ptr, etc.)
@@ -2311,9 +2327,12 @@ class FlashInferIndicesUpdaterPrefill:
             raise RuntimeError(
                 "NVFP4 custom KV indices are only supported by the single-wrapper FlashInfer path."
             )
+        import os as _os_dbg2
+        _vstage_u = int(_os_dbg2.environ.get("SGLANG_VERIFY_STAGE", "1"))
         custom_kv_indices_swa = (
             self.attn_backend.dq_swa_page_table
-            if custom_kv_indices is not None
+            if _vstage_u != 2
+            and custom_kv_indices is not None
             and (
                 self.attn_backend.decode_as_extend
                 or getattr(self.attn_backend, "_in_target_verify", False)
@@ -2585,8 +2604,11 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask = cross_attention_custom_mask
         else:
             assert isinstance(spec_info, SpecInput)
+            import os as _os_dbg
+            _vstage = int(_os_dbg.environ.get("SGLANG_VERIFY_STAGE", "1"))
             if (
-                custom_kv_indices is not None
+                _vstage != 4
+                and custom_kv_indices is not None
                 and self.attn_backend.dq_paged_kernel_lens is not None
             ):
                 # NVFP4 target-verify: plan over the FP8 dequant workspace
