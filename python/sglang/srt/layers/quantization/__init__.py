@@ -19,6 +19,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.exl3 import ExL3Config
 from sglang.srt.layers.quantization.gguf import GGUFConfig
 from sglang.srt.layers.quantization.gptq import (
     CPUGPTQConfig,
@@ -87,6 +88,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "quark_int4fp8_moe": QuarkInt4Fp8Config,
     "humming": HummingConfig,
     "mxfp_w4a8": Mxfp4W4A8Config,
+    "exl3": ExL3Config,
 }
 
 
