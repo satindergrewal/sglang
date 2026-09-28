@@ -1335,22 +1335,33 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             and not getattr(self, "_probe_done", False)
         )
         if _probe:
-            # reference: per-expert loop with the dense op on the same pairs
-            ref = torch.zeros_like(x_pairs, dtype=torch.float16)
-            ref = torch.zeros((x_pairs.shape[0], packed["down_n"]),
+            # Full-pipeline probe: the runner output vs the per-expert dequant
+            # reference on the SAME raw input/routing (the offline-gate
+            # construction, inside the serve).
+            ref = torch.zeros((x.shape[0], packed["down_n"]),
                               dtype=torch.float32, device=dev)
             counts_cpu = counts.cpu(); counts_cpu[E] = 0
             offsets_cpu = offsets.cpu()
+            tok_cpu = tok.cpu() if torch.is_tensor(tok) else None
             for i in range(E):
                 s0 = int(offsets_cpu[i].item()); c = int(counts_cpu[i].item())
                 if c <= 0: continue
                 ge = packed["gate"][i]; ue = packed["up"][i]; de = packed["down"][i]
-                xe = x_pairs[s0:s0+c]
+                rows = (tok_cpu[s0:s0+c] if tok_cpu is not None
+                        else (order[s0:s0+c].cpu() // ids.shape[-1]))
+                xe = x[rows]
                 ge_d = dequant_matrix_orig(ge[1], ge[2], ge[3], "mul1").float()
                 ue_d = dequant_matrix_orig(ue[1], ue[2], ue[3], "mul1").float()
                 de_d = dequant_matrix_orig(de[1], de[2], de[3], "mul1").float()
                 m_r = (F.silu(xe.float() @ ge_d) * (xe.float() @ ue_d)) @ de_d
-                ref[s0:s0+c] = m_r
+                ref.index_add_(0, rows.cpu(), m_r * pw[s0:s0+c].float()[:, None].cpu())
+            cos = torch.nn.functional.cosine_similarity(
+                out.float().flatten(), ref.flatten(), dim=0).item()
+            print(f"MOEPROBE full-pipeline cos {cos:.6f} "
+                  f"out_abs {out.abs().max().item():.4f} "
+                  f"ref_abs {ref.abs().max().item():.4f} "
+                  f"pairs {x_pairs.shape[0]} bs {x.shape[0]}", flush=True)
+            self._probe_done = True
         act = runner_config.activation
         o_g = grouped_gemm(xh_gate, "gate", packed["gate_n"], 4)
         o_u = grouped_gemm(xh_up, "up", packed["gate_n"], 4)
