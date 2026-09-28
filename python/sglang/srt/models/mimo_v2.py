@@ -466,7 +466,14 @@ class MiMoV2MoE(nn.Module):
             and quant_config is not None
             and quant_config.get_name() == "exl3"
         ):
-            self.experts.interm_comp = 128.0
+            # The last MoE layer's up_proj MAY be stored divided by 128 with
+            # the compensation folded into the routing weights. The convention
+            # is declared by the converter in quantization_config
+            # ("interm_comp_last_layer"); legacy artifacts predate the flag and
+            # were divided, so the default stays 128.
+            self.experts.interm_comp = float(
+                quant_config.get("interm_comp_last_layer", 128.0)
+            )
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
