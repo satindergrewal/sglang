@@ -427,6 +427,9 @@ class ExL3Config(QuantizationConfig):
         self.mtp_bits = mtp_bits
         self.calibration = calibration
         self.tensor_storage = tensor_storage or {}
+        # Preserve undeclared keys (e.g. interm_comp_last_layer) for the model
+        # code to read without depending on the raw config dict.
+        self.extra = dict(extra)
 
     def get_name(self) -> str:
         return "exl3"
@@ -453,6 +456,10 @@ class ExL3Config(QuantizationConfig):
             mtp_bits=config.get("mtp_bits"),
             calibration=config.get("calibration"),
             tensor_storage=config.get("tensor_storage"),
+            **{k: v for k, v in config.items()
+               if k not in ("version", "bpw", "head_bits", "codebook",
+                            "out_scales", "mtp_bits", "calibration",
+                            "tensor_storage", "quant_method")},
         )
 
     def get_scaled_act_names(self) -> List[str]:
