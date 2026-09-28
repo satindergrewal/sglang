@@ -1386,14 +1386,6 @@ class ExL3MoEMethod(FusedMoEMethodBase):
                   f"pairs {x_pairs.shape[0]} bs {x.shape[0]}", flush=True)
             self._probe_done = True
 
-        if _probe:
-            cos = torch.nn.functional.cosine_similarity(
-                o_d[: ref.shape[0]].float(), ref, dim=0).item()
-            print(f"MOEPROBE grouped-vs-dequant cos {cos:.6f} "
-                  f"out_abs {o_d.abs().max().item():.4f} "
-                  f"ref_abs {ref.abs().max().item():.4f} "
-                  f"pairs {x_pairs.shape[0]}", flush=True)
-            self._probe_done = True
         return out
 
     def run_packed_moe(self, dispatch_output, runner_config):
