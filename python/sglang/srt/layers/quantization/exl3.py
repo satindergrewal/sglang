@@ -365,6 +365,11 @@ _EXL3_PARAMS = ("trellis", "suh", "svh", "mul1", "mcg", "bias")
 
 class MoEGroupedOverflow(Exception):
     """Pair count exceeds the grouped kernel's per-pass capacity."""
+
+try:
+    _HAS_HAD_IN_PAIRS = hasattr(torch.ops.sgl_exl3_grouped, "grouped_had_in_pairs")
+except (AttributeError, RuntimeError):
+    _HAS_HAD_IN_PAIRS = False
 _SHARD_NAME_TO_INDEX = {"q": 0, "k": 1, "v": 2}
 _PARAM_DTYPES = {
     "trellis": torch.int16,
@@ -1277,10 +1282,19 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         # transform (zero-count experts, overflow, sentinel) are zeroed.
         xh_gate = torch.empty_like(x_pairs)
         xh_up = torch.empty_like(x_pairs)
-        torch.ops.sgl_exl3_grouped.grouped_had_in(
-            x_pairs, packed["gate_suh_ptrs_dev"], counts, offsets, 64, xh_gate)
-        torch.ops.sgl_exl3_grouped.grouped_had_in(
-            x_pairs, packed["up_suh_ptrs_dev"], counts, offsets, 64, xh_up)
+        # Pair-indexed transform when the kernel offers it: one small grid
+        # (P x k/1024) instead of (rows_cap x E x k/1024) mostly-empty blocks.
+        if _HAS_HAD_IN_PAIRS:
+            sids_i32 = sids.to(torch.int32)
+            torch.ops.sgl_exl3_grouped.grouped_had_in_pairs(
+                x_pairs, sids_i32, packed["gate_suh_ptrs_dev"], xh_gate)
+            torch.ops.sgl_exl3_grouped.grouped_had_in_pairs(
+                x_pairs, sids_i32, packed["up_suh_ptrs_dev"], xh_up)
+        else:
+            torch.ops.sgl_exl3_grouped.grouped_had_in(
+                x_pairs, packed["gate_suh_ptrs_dev"], counts, offsets, 64, xh_gate)
+            torch.ops.sgl_exl3_grouped.grouped_had_in(
+                x_pairs, packed["up_suh_ptrs_dev"], counts, offsets, 64, xh_up)
 
         import os as _os
         _probe = (
@@ -1317,8 +1331,12 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         # Down projection consumes mid in the Hadamard domain per expert —
         # same single-launch grouped transform (down owns its suh).
         mid_t = torch.empty_like(mid)
-        torch.ops.sgl_exl3_grouped.grouped_had_in(
-            mid, packed["down_suh_ptrs_dev"], counts, offsets, 64, mid_t)
+        if _HAS_HAD_IN_PAIRS:
+            torch.ops.sgl_exl3_grouped.grouped_had_in_pairs(
+                mid, sids_i32, packed["down_suh_ptrs_dev"], mid_t)
+        else:
+            torch.ops.sgl_exl3_grouped.grouped_had_in(
+                mid, packed["down_suh_ptrs_dev"], counts, offsets, 64, mid_t)
         mid = mid_t        # Down projection: pair rows reach the combine. Output pre-zeroed so
         # rows the kernel did not process (zero-count experts, overflow,
         # sentinel) contribute nothing — no CPU-side staging needed.
