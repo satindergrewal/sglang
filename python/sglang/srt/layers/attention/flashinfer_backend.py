@@ -2671,45 +2671,33 @@ class FlashInferIndicesUpdaterPrefill:
                 and custom_kv_indices is not None
                 and self.attn_backend.dq_paged_kernel_lens is not None
             ):
-                # NVFP4 target-verify: plan over the FP8 dequant workspace
-                # rows, not the packed-FP4 pool page table. The per-wrapper
-                # dq table and lens were swapped in by update_sliding_window
-                # (a-side full / b-side window-trimmed); the queries are the
-                # uniform draft tokens, so qo_indptr steps by
-                # num_tokens_per_req.
-                kv_indices = custom_kv_indices
-                kv_indptr[1 : bs + 1] = torch.cumsum(
-                    self.attn_backend.dq_paged_kernel_lens, dim=0
-                )
-                kv_indptr = kv_indptr[: bs + 1]
-                ntr = int(spec_info.num_tokens_per_req)
-                import os as _os
-                if _os.environ.get("SGLANG_DEBUG_VERIFY_DQ"):
-                    _ref = spec_info.generate_attn_arg_prefill(
-                        req_pool_indices, paged_kernel_lens, paged_kernel_lens_sum,
-                        self.req_to_token,
+                # NVFP4 target-verify: keep the spec's own segment structure
+                # (per-req kv_start offsets, tree mask, draft-token qo) and
+                # translate the gathered pool locs into dequant-workspace
+                # rows — a-side origins for the full wrapper, b-side origins
+                # for the SWA wrapper.
+                if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
+                    kv_indices, kv_indptr, qo_indptr, custom_mask = (
+                        spec_info.generate_attn_arg_prefill(
+                            req_pool_indices,
+                            paged_kernel_lens,
+                            paged_kernel_lens_sum,
+                            self.req_to_token,
+                            kv_start_idx=kv_start_idx,
+                        )
                     )
-                    logger.warning(
-                        "[VERIFY-PLAN] bs=%d ntr=%d my_qo=%s ref_qo=%s my_kv_ip=%s ref_kv_ip=%s my_kv0=%s ref_kv0=%s dqlens=%s pagedlens=%s",
-                        bs, ntr,
-                        qo_indptr[:9].tolist(),
-                        _ref[2][:9].tolist() if _ref[2] is not None else None,
-                        kv_indptr[:9].tolist(),
-                        _ref[1][:9].tolist() if _ref[1] is not None else None,
-                        kv_indices[:8].tolist(),
-                        _ref[0][:8].tolist() if _ref[0] is not None else None,
-                        self.attn_backend.dq_paged_kernel_lens.tolist()[:8],
-                        paged_kernel_lens.tolist()[:8] if paged_kernel_lens is not None else None,
+                else:
+                    kv_indices, kv_indptr, qo_indptr, custom_mask = (
+                        spec_info.generate_attn_arg_prefill(
+                            req_pool_indices,
+                            paged_kernel_lens,
+                            paged_kernel_lens_sum,
+                            self.req_to_token,
+                        )
                     )
-                qo_indptr[1 : bs + 1] = torch.arange(
-                    ntr,
-                    (bs + 1) * ntr,
-                    step=ntr,
-                    dtype=qo_indptr.dtype,
-                    device=qo_indptr.device,
+                kv_indices = self._translate_verify_table_to_workspace(
+                    kv_indptr, kv_start_idx, custom_is_b_side
                 )
-                qo_indptr = qo_indptr[: bs + 1]
-                custom_mask = None
                 force_plain_plan = True
             elif spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
