@@ -298,6 +298,8 @@ class SWAKVPool(BaseSWAKVPool):
         kv_lens = []
         locs_parts = []
         valid_parts = []
+        pos0_parts = []
+        row_origin_parts = []
         device = req_to_token.device
         for i in range(len(req_pool_indices_cpu)):
             req_idx = int(req_pool_indices_cpu[i])
@@ -313,12 +315,25 @@ class SWAKVPool(BaseSWAKVPool):
                 table_entries.append(
                     torch.arange(row, row + keep, dtype=torch.int32, device=device)
                 )
+                pos0_parts.append(torch.tensor(start, dtype=torch.int64, device=device))
+                row_origin_parts.append(
+                    torch.tensor(row, dtype=torch.int64, device=device)
+                )
             else:
                 table_entries.append(
                     torch.zeros(0, dtype=torch.int32, device=device)
                 )
+                pos0_parts.append(torch.tensor(end, dtype=torch.int64, device=device))
+                row_origin_parts.append(torch.tensor(row, dtype=torch.int64, device=device))
             kv_lens.append(keep)
             row += keep
+
+        # Per-req b-side row origins for spec-verify table translation:
+        # position pos0_parts[i] lives at b-side row row_origin_parts[i].
+        self.swa_kv_pool._swa_dq_origins = (
+            torch.stack(pos0_parts) if pos0_parts else torch.zeros(0, dtype=torch.int64, device=device),
+            torch.stack(row_origin_parts) if row_origin_parts else torch.zeros(0, dtype=torch.int64, device=device),
+        )
 
         if locs_parts:
             locs = torch.cat(locs_parts)

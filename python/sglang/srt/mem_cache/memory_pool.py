@@ -2823,8 +2823,14 @@ class MHATokenToKVPool(KVCache):
         k_cur: Optional[torch.Tensor] = None,
         v_cur: Optional[torch.Tensor] = None,
         layer_id_override: Optional[int] = None,
+        use_b_side: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the FlashInfer FP8 KV view for a quantized KV cache.
+
+        ``use_b_side`` is SWA-only (window-trimmed workspace copy); a plain
+        MHATokenToKVPool has no b-side, so the flag is accepted and ignored —
+        drafter pools hit this when the draft model shares the target's
+        nvfp4 recipe without SWA plumbing.
 
         FlashInfer prefill consumes FP8 KV. Quantized pools store packed FP4 plus
         per-block scales, so the pool owns the dequant workspace and returns the
@@ -2906,8 +2912,8 @@ class MHATokenToKVPool(KVCache):
         locs, valid, row_end = plan
         dq_k, dq_v = self.get_dequant_workspace_b()
         row = self.page_size
-        dq_k[row:row_end].zero_()
-        dq_v[row:row_end].zero_()
+        dq_k[0:row_end].zero_()
+        dq_v[0:row_end].zero_()
         if locs.numel() == 0:
             return
         layer_id_pool = (

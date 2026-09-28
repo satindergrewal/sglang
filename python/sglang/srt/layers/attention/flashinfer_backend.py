@@ -927,6 +927,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
         self.dq_full_paged_kernel_lens = None
+        self.dq_workspace_starts = None
         # A stale b-side table from an earlier decode step must never leak
         # into a regular extend batch's SWA wrapper plan.
         self.dq_swa_page_table = None
@@ -1032,6 +1033,9 @@ class FlashInferAttnBackend(AttentionBackend):
             paged_seq_lens,
             dtype=torch.int32,
             device=device,
+        )
+        self.dq_workspace_starts = torch.tensor(
+            starts[: len(paged_seq_lens)], dtype=torch.int64, device=device
         )
         # Stash the a-side lengths: the SWA wrapper swap below overwrites
         # dq_paged_kernel_lens with the b-side (window-trimmed) lengths, and
@@ -1158,10 +1162,11 @@ class FlashInferAttnBackend(AttentionBackend):
                         self.req_to_token_pool.req_to_token,
                         forward_batch.req_pool_indices.cpu().tolist(),
                         seq_lens_cpu_v,
-                        self.sliding_window_size,
                         # Verify has no ragged side: the b-side rows cover
-                        # the full window including the newest draft tokens
-                        # (saved into the pool before attention).
+                        # the window plus the draft tokens (saved into the
+                        # pool before attention), matching the spec's
+                        # window-trim + draft segment length.
+                        self.sliding_window_size + ntr_swa,
                         include_last_token=True,
                     )
                 )
@@ -2432,6 +2437,9 @@ class FlashInferIndicesUpdaterPrefill:
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
                 custom_kv_indices=wrapper_custom,
+                custom_is_b_side=(
+                    wrapper_id == 0 and custom_kv_indices_swa is not None
+                ),
                 # paged-only SWA path only; ragged keeps its custom prefix
                 # mask, spec-verify keeps its tree mask
                 window_left=(
@@ -2535,6 +2543,46 @@ class FlashInferIndicesUpdaterPrefill:
                 ),
             )
 
+    def _translate_verify_table_to_workspace(
+        self,
+        kv_indptr: torch.Tensor,
+        kv_start_idx: Optional[torch.Tensor],
+        is_b_side: bool,
+    ) -> torch.Tensor:
+        """Map a spec-verify pool-loc table onto dequant-workspace rows.
+
+        The spec builders gather req_to_token segments (pool locs); the
+        workspace holds the same per-request positions at row origins
+        dq_workspace_starts (a-side) or the SWA b-side origins (positions
+        before the b-side window land in the zeroed scratch region, matching
+        the fp8 path's treatment of evicted SWA slots).
+        """
+        ab = self.attn_backend
+        dev = kv_indptr.device
+        lens = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int64)
+        total = int(lens.sum().item())
+        if total == 0:
+            return torch.zeros(0, dtype=torch.int32, device=dev)
+        seg = torch.repeat_interleave(
+            torch.arange(len(lens), device=dev, dtype=torch.int64), lens
+        )
+        t = torch.arange(total, device=dev, dtype=torch.int64) - (
+            torch.repeat_interleave(kv_indptr[:-1].to(torch.int64), lens)
+        )
+        if kv_start_idx is not None:
+            ks = kv_start_idx[seg].to(torch.int64)
+        else:
+            ks = torch.zeros_like(t)
+        if is_b_side:
+            pos0, bor = ab.token_to_kv_pool.swa_kv_pool._swa_dq_origins
+            offset = ks - pos0[seg] + t
+            rows = torch.where(
+                offset >= 0, bor[seg] + offset, torch.zeros_like(offset)
+            )
+        else:
+            rows = ab.dq_workspace_starts[seg] + ks + t
+        return rows.to(torch.int32)
+
     def call_begin_forward(
         self,
         wrapper_ragged: BatchPrefillWithRaggedKVCacheWrapper,
@@ -2555,6 +2603,7 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         seq_lens_cpu: Optional[torch.Tensor] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        custom_is_b_side: bool = False,
         window_left: int = -1,
     ):
         bs = len(seq_lens)
