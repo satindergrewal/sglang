@@ -1205,23 +1205,25 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         torch.ops.sgl_kernel.sgl_exl3_linear(xh, trellis, svh, bias, cb, out)
         return out
 
-    def _grouped_ws_make(self, E, packed, splits=4):
+    def _grouped_ws_make(self, E, packed, splits=4, rows=16, chunks=4):
         """Persistent grouped-kernel workspaces keyed by (projection,
-        col_blocks); sized for the worst case (CH=4 chunks). Zeros are
-        restored in-kernel after each launch, so reuse is graph-safe."""
+        col_blocks). rows = ws slab rows (16 full / 4 decode variant);
+        chunks = pair-chunks per expert (rows*chunks = per-expert pair
+        capacity the overflow check enforces). Zeros are restored in-kernel
+        after each launch, so reuse is graph-safe."""
         gate_n = packed["gate_n"]
         down_n = packed["down_n"]
         dev = packed["gate_ptrs"].device
-        CH = 4
+        CH = chunks
         ws_by = {}
         cnt_by = {}
         for proj, n_out in (("gate", gate_n), ("up", gate_n), ("down", down_n)):
             cb_n = int(n_out // 128)
             ws_by[(proj, cb_n)] = torch.zeros(
-                (cb_n, splits, (E + 1) * CH, 16, 128),
+                (cb_n, splits, E * CH, rows, 128),
                 dtype=torch.float32, device=dev)
             cnt_by[(proj, cb_n)] = torch.zeros(
-                ((E + 1) * cb_n, CH), dtype=torch.int32, device=dev)
+                (E * cb_n, CH), dtype=torch.int32, device=dev)
         return (E, ws_by, cnt_by)
 
     def _run_packed_moe_grouped(self, x, ids, wts, packed, out_dt,
@@ -1236,12 +1238,8 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         rsf = runner_config.routed_scaling_factor
         wscale = comp * (rsf if rsf is not None else 1.0)
         dev = x.device
-        # splits stays 4 at ALL P: measured A/B on the 111 decode load —
-        # splits=1 at small P is 53% SLOWER (68.83 vs 98.97 tok/s). The
-        # mostly-empty E*CH z-blocks are cheap to dispatch; the cost is the
-        # expert-major weight streaming inside the active blocks, which needs
-        # the k-parallel splits for occupancy.
-        splits = 4
+
+
         if _HAS_FUSED_ROUTE and P <= 512 and os.environ.get("EXL3_MOE_NO_FUSED_ROUTE") != "1":
             # Two-launch fused routing (single-block bitonic sort + gather
             # grid). Replaces ~10 tiny torch kernels (~80us of launch
@@ -1263,7 +1261,7 @@ class ExL3MoEMethod(FusedMoEMethodBase):
                 wts.reshape(-1).to(torch.float32).contiguous(),
                 E, K, wscale, x_pairs, pw)
             if (not torch.cuda.is_current_stream_capturing()
-                    and int(counts[:E].max().item()) > 16 * 4):
+                    and int(counts[:E].max().item()) > rows * chunks):
                 raise MoEGroupedOverflow()
             CH = 4
         else:
@@ -1296,7 +1294,7 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             # SORTED order (pw is wts[order]); sids == key[order].
             pw = torch.where(sids < E, pw, torch.zeros_like(pw))
             if (not torch.cuda.is_current_stream_capturing()
-                    and int(counts[:E].max().item()) > 16 * 4):
+                    and int(counts[:E].max().item()) > rows * chunks):
                 raise MoEGroupedOverflow()
 
             CH = 4
@@ -1309,10 +1307,27 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         # of the decode step in GPU kernel time). The kernels restore the
         # workspace zeros in-place after each launch, so sharing/reuse is
         # graph-safe.
-        key = (E, packed["gate_n"], packed["down_n"], splits, packed["gate_ptrs"].device.index)
+        # Variant selection (measured): at decode P (<=64 pairs) the launch
+        # is latency-bound at low active-block counts; the rows=4 ws slab
+        # (only m<=4 rows are real at decode) quarters the split-reduction
+        # traffic, making splits=16 profitable (kernels restore zeros
+        # in-place). Eager-only: the overflow check needs a host sync, and
+        # captured graphs must keep the rows=16 worst-case layout.
+        capturing = torch.cuda.is_current_stream_capturing()
+        if P <= 64 and not capturing:
+            rows, chunks, splits_v = 4, 8, 16
+        else:
+            rows, chunks, splits_v = 16, 4, 4
+        # ONE shared workspace set per (E, gate_n, down_n, splits, rows,
+        # chunks, device) across all MoE layers: the shapes are
+        # layer-identical. Per-layer persistence (47 x ~200 MB) OOMs the KV
+        # pool, while per-step allocation re-fills ~200 MB of zeros every
+        # layer every step (~50% of the decode step in GPU kernel time).
+        key = (E, packed["gate_n"], packed["down_n"], splits_v, rows, chunks,
+               packed["gate_ptrs"].device.index)
         ws_cache = _GROUPED_WS_CACHE.get(key)
         if ws_cache is None:
-            ws_cache = self._grouped_ws_make(E, packed, splits)
+            ws_cache = self._grouped_ws_make(E, packed, splits_v, rows, chunks)
             _GROUPED_WS_CACHE[key] = ws_cache
         _, ws_by, cnt_by = ws_cache
 
@@ -1358,8 +1373,8 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             and not getattr(self, "_probe_done", False)
         )
         act = runner_config.activation
-        o_g = grouped_gemm(xh_gate, "gate", packed["gate_n"], splits)
-        o_u = grouped_gemm(xh_up, "up", packed["gate_n"], splits)
+        o_g = grouped_gemm(xh_gate, "gate", packed["gate_n"], splits_v)
+        o_u = grouped_gemm(xh_up, "up", packed["gate_n"], splits_v)
         if act == "silu":
             mid = (F.silu(o_g.float()) * o_u.float()).to(out_dt)
         elif act == "gelu":
@@ -1378,7 +1393,7 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         mid = mid_t        # Down projection: pair rows reach the combine. Output pre-zeroed so
         # rows the kernel did not process (zero-count experts, overflow,
         # sentinel) contribute nothing — no CPU-side staging needed.
-        o_d = grouped_gemm(mid, "down", packed["down_n"], splits, zero_init=True)
+        o_d = grouped_gemm(mid, "down", packed["down_n"], splits_v, zero_init=True)
         out = torch.zeros((x.shape[0], packed["down_n"]),
                           dtype=torch.float32, device=dev)
         out.index_add_(0, tok, o_d.float() * pw[:, None].to(out.dtype))
