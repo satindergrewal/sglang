@@ -1,0 +1,36 @@
+--- exl3-upstream-dev/exllamav3/modules/quant/exl3_lib/quantize.py	2026-09-26 10:43:16.307482648 +1200
++++ exl3-mimo-conv/exllamav3/modules/quant/exl3_lib/quantize.py	2026-09-28 20:23:37.040887722 +1300
+@@ -51,13 +51,14 @@
+ 
+ @lru_cache
+ def get_temp_buffers(device, K: int, tile_len: int = 256, cb: int = 0):
++    K = int(K)  # recipe bitrates arrive as floats (3.0/3.5); the ext and bit math want the integer KA
+     index = torch.device(device).index if not isinstance(device, int) else device
+     if index is None:
+         index = torch.cuda.current_device()
+     # The extension picks the kernel per architecture / K / codebook and reports the wave it can
+     # keep resident (blocks per SM x SMs); the dense specializations keep costs in shared memory
+     # and store one branch bit (K = 1) or byte (K >= 2) per state
+-    optimized, wave = ext.quantize_tiles_scratch(index, K, cb == 1, cb == 2, tile_len)
++    optimized, wave = ext.quantize_tiles_scratch(int(index), int(K), bool(cb == 1), bool(cb == 2), int(tile_len))
+     if optimized:
+         history_cols = (65536 >> K) // (8 if K == 1 else 1)
+         temp_costs = torch.empty((1,), dtype = torch.half, device = device)
+@@ -145,7 +146,7 @@
+         quantized_idx,
+         temp_costs,
+         temp_edges,
+-        K,
++        int(K),
+         mcg,
+         mul1,
+     )
+@@ -1076,6 +1077,8 @@
+ 
+ def pack_trellis(encoded: torch.Tensor, quant_args: dict) -> torch.Tensor:
+     K = quant_args["K"]
++    if float(K).is_integer():
++        K = int(K)
+     shape = encoded.shape
+     assert len(shape) == 3 and shape[2] == 256
+     assert encoded.dtype == torch.int16
