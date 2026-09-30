@@ -1,0 +1,12 @@
+nvfp4-exl3-nodraft | pool=241902 | coh=Paris | 16/16 | 50.40 tok/s | TPOT 66.08ms
+nvfp4-native-nodraft | pool=93031 | coh=city-center | 16/16 | 63.91 tok/s | TPOT 52.09ms
+nvfp4-exl3-dflash | pool=180387 | coh=Paris | 16/16 | 118.75 tok/s | TPOT 36.41ms | fp8 draft KV, decode graphs off
+nvfp4-native-dflash | pool=46515 | coh=Louvre | 16/16 | 252.82 tok/s | TPOT 18.01ms | fp8 draft KV
+nvfp4-exl3-eagle | pool=142785 | coh=Paris | 16/16 | 69.36 tok/s | TPOT 53.50ms
+nvfp4-native-eagle | pool=17894 | coh=Louvre | 16/16 | 96.73 tok/s | TPOT 41.43ms
+fp8-exl3-nodraft | pool=241902 | coh=Paris | 16/16 | 98.97 tok/s | TPOT 33.01ms | image 28t
+fp8-native-nodraft | pool=93031 | coh=romance-art | 16/16 | 227.06 tok/s | TPOT 14.29ms | image 28s
+fp8-exl3-dflash | pool=180387 | coh=Paris | 16/16 | 126.69 tok/s | TPOT 27.61ms | image 28t
+fp8-native-dflash | pool=46515 | coh=romance-art | 16/16 | 288.52 tok/s | TPOT 11.47ms | image 28t
+fp8-exl3-eagle | pool=142785 | coh=Paris | 16/16 | 81.47 tok/s | TPOT 42.90ms | radix ON, image 28t
+fp8-native-eagle | pool=17894 | coh=romance-art | 16/16 | 171.95 tok/s | TPOT 21.08ms | radix ON, image 28s
