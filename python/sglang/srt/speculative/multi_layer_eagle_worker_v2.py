@@ -618,7 +618,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # target-scale indices: garbage at best, illegal access at worst.
         # The draft pool starts empty for this request, so the draft extend
         # must process exactly the new tokens with prefix 0.
-        if batch.extend_prefix_lens is not None:
+        if getattr(batch, "extend_prefix_lens", None) is not None:
             batch.extend_prefix_lens = [0] * len(batch.extend_prefix_lens)
         if getattr(batch, "extend_prefix_lens_cpu", None) is not None:
             batch.extend_prefix_lens_cpu = [0] * len(batch.extend_prefix_lens_cpu)
