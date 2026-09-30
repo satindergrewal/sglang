@@ -131,6 +131,24 @@ decomposition above are the baseline for that work. All numbers carry the
 SHM-transport caveat (this box's P2P is hardware-faulted; NCCL runs
 P2P_DISABLE=1 SHM staging on both sides, so the EXL3-vs-native comparison is
 transport-fair).
+
+**Kernel levers tried on the grouped GEMM (this session)**: rreg sweep
+(4-9%, earlier), pair-indexed had_in (22x, shipped), workspace caching
+(+87% end-to-end, shipped), and an adaptive-splits A/B on the grid geometry
+— grid(32, splits, E*CH=256) is ~8x empty at decode, but splits=1 at small P
+measured **53% slower** (68.83 vs 98.97 tok/s): the empty z-blocks are cheap,
+the cost is expert-major weight streaming inside the active blocks (~421 GB/s
+effective on the trellis panels), and the k-parallel splits carry occupancy.
+splits=4 retained (A/B documented in-code, commit cc2bacc48a). The remaining
+gap is the trellis inner-loop decode cost per weight tile — a tensor-core-
+class kernel rewrite, the next campaign's opening item.
+
+**Item-1 note**: the literal "EXL3 >= native in every cell" is not met
+numerically (EXL3 at 44-48% of native in fp8, 47-79% in nvfp4). What IS
+delivered: the gap decomposed to named, measured kernels with every cheap
+lever exhausted (four levers tried, two shipped, one negative-documented),
+plus the tooling to iterate. Closing it to parity is a dedicated
+trellis-GEMM kernel-rewrite campaign — an owner decision on scope.
 ## 6. Converter durability (DONE)
 - `sglang-vendorport/exl3-converter/float_k_casts.patch` — int(K) casts at
   the ext boundaries (get_temp_buffers / quantize_tiles_scratch /
