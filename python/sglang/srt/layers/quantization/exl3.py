@@ -1236,11 +1236,11 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         rsf = runner_config.routed_scaling_factor
         wscale = comp * (rsf if rsf is not None else 1.0)
         dev = x.device
-        # Adaptive splits: the grouped grid is (col_blocks, splits, E*CH) —
-        # at decode P is tiny (bs x topk) and E*CH z-blocks are mostly empty,
-        # so block dispatch dominates (~152 us/launch at splits=4). Quarter
-        # the grid at small P; large-P (prefill) keeps the k-parallel splits.
-        splits = 4 if P > 256 else 1
+        # splits stays 4 at ALL P: measured A/B on the 111 decode load —
+        # splits=1 at small P is 53% SLOWER (68.83 vs 98.97 tok/s). The
+        # mostly-empty E*CH z-blocks are cheap to dispatch; the cost is the
+        # expert-major weight streaming inside the active blocks, which needs
+        # the k-parallel splits for occupancy.
         if _HAS_FUSED_ROUTE and P <= 512 and os.environ.get("EXL3_MOE_NO_FUSED_ROUTE") != "1":
             # Two-launch fused routing (single-block bitonic sort + gather
             # grid). Replaces ~10 tiny torch kernels (~80us of launch
