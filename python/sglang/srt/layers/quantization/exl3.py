@@ -366,6 +366,8 @@ _EXL3_PARAMS = ("trellis", "suh", "svh", "mul1", "mcg", "bias")
 class MoEGroupedOverflow(Exception):
     """Pair count exceeds the grouped kernel's per-pass capacity."""
 
+_GROUPED_WS_CACHE: dict = {}
+
 try:
     _HAS_HAD_IN_PAIRS = hasattr(torch.ops.sgl_exl3_grouped, "grouped_had_in_pairs")
 except (AttributeError, RuntimeError):
@@ -1295,13 +1297,17 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             CH = 4
         # Persistent per-layer workspace/counters (fixed shapes): avoids
         # several GB of alloc/free per pass; zeros are restored in-kernel.
-        ws_cache = getattr(self, "_grouped_ws", None)
-        if ws_cache is None or ws_cache[0] != E:
+        # ONE shared workspace set per (E, gate_n, down_n, device) across all
+        # MoE layers: the shapes are layer-identical. Per-layer persistence
+        # (47 x ~200 MB) OOMs the KV pool, while per-step allocation re-fills
+        # ~200 MB of zeros every layer every step (~50% of the decode step in
+        # GPU kernel time). The kernels restore the workspace zeros in-place
+        # after each launch, so sharing/reuse is graph-safe.
+        key = (E, packed["gate_n"], packed["down_n"], packed["gate_ptrs"].device.index)
+        ws_cache = _GROUPED_WS_CACHE.get(key)
+        if ws_cache is None:
             ws_cache = self._grouped_ws_make(E, packed)
-            # Persist: without this, _grouped_ws_make's three ~67 MB zeroed
-            # workspaces re-allocate (and re-fill) EVERY MoE layer EVERY step
-            # — ~50% of the whole decode step in kernel time.
-            self._grouped_ws = ws_cache
+            _GROUPED_WS_CACHE[key] = ws_cache
         _, ws_by, cnt_by = ws_cache
 
         def grouped_gemm(xp, proj, n_out, splits, zero_init=False):
