@@ -1066,6 +1066,18 @@ class FlashInferAttnBackend(AttentionBackend):
             swa_out_cache_loc = self.kv_index_translator.sliding_window_write_loc_for(
                 forward_batch.out_cache_loc
             )
+            import os as _os_sw
+            if (_os_sw.environ.get("SGLANG_DRAFT_EXTEND_DEBUG")
+                    and _os_sw.environ.get("SGLANG_SWA_TRACE") == "1"):
+                logger.warning(
+                    "[SWA-WRITE] draft_be=%s mode=%s out_loc_n=%s swa_n=%s "
+                    "swa_max=%s neg=%s",
+                    getattr(self, "_is_draft_backend", False),
+                    forward_batch.forward_mode.name,
+                    forward_batch.out_cache_loc.numel(),
+                    swa_out_cache_loc.numel() if swa_out_cache_loc is not None else -1,
+                    swa_out_cache_loc.max().item() if swa_out_cache_loc is not None and swa_out_cache_loc.numel() else -1,
+                    int((swa_out_cache_loc < 0).sum().item()) if swa_out_cache_loc is not None else -1)
 
         if forward_batch.forward_mode.is_decode_or_idle() and not self.decode_as_extend:
             self.indices_updater_decode.update(
@@ -1538,6 +1550,17 @@ class FlashInferAttnBackend(AttentionBackend):
         save_kv_cache=True,
         sinks=None,
     ):
+        import os as _os_fe
+        if _os_fe.environ.get("SGLANG_DRAFT_EXTEND_DEBUG"):
+            _fe_n = getattr(self, "_fe_trace_n", 0)
+            self._fe_trace_n = _fe_n + 1
+            with open("/tmp/fe_trace_" + str(_os_fe.getpid()) + ".log", "a") as _f:
+                _f.write(f"n={_fe_n} layer={getattr(layer, 'layer_id', '?')} "
+                         f"swa={layer.sliding_window_size is not None and layer.sliding_window_size != -1} "
+                         f"draft_be={getattr(self, '_is_draft_backend', False)} "
+                         f"mode={forward_batch.forward_mode.name} "
+                         f"q={tuple(q.shape)} sinks={sinks is not None} "
+                         f"bs={forward_batch.batch_size}\n")
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -1649,6 +1672,19 @@ class FlashInferAttnBackend(AttentionBackend):
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
             if sinks is not None:
+                import os as _os_d
+                if (_os_d.environ.get("SGLANG_DRAFT_EXTEND_DEBUG")
+                        and getattr(self, "_is_draft_backend", False)):
+                    logger.warning(
+                        "[DRAFT-EXT] q=%s kv=%s indptr=%s idx_n=%s lens=%s lse_n=%s "
+                        "sinks=%s lastplen=%s",
+                        tuple(q.view(-1, layer.tp_q_head_num, layer.head_dim).shape),
+                        tuple(kv_cache.shape) if kv_cache is not None else None,
+                        self.kv_indptr[self._get_wrapper_idx(layer)][:9].tolist()
+                        if self.kv_indptr is not None else None,
+                        None, None, None,
+                        tuple(sinks.shape) if sinks is not None else None,
+                        None)
                 o, lse = prefill_wrapper_paged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     kv_cache,
@@ -1726,6 +1762,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_head_dim_r = getattr(layer, "v_head_dim", None) or layer.head_dim
                 v_r = v.view(-1, layer.tp_v_head_num, v_head_dim_r)
                 if sinks is not None:
+                    import os as _os_d3
+                    if (_os_d3.environ.get("SGLANG_DRAFT_EXTEND_DEBUG")
+                            and getattr(self, "_is_draft_backend", False)):
+                        logger.warning(
+                            "[DRAFT-RAGGED-ONLY] q=%s no_prefix=%s",
+                            tuple(q.shape), self.forward_metadata.extend_no_prefix)
                     o, lse = self.prefill_wrapper_ragged.forward_return_lse(
                         q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k.view(-1, layer.tp_k_head_num, layer.head_dim),
@@ -1768,6 +1810,19 @@ class FlashInferAttnBackend(AttentionBackend):
                 # path (the SWA trim is physical in the updater / b-side
                 # table); re-passing a window at run time diverges from the
                 # planned module and corrupts the kernel. Keep them equal.
+                import os as _os_d2
+                if _os_d2.environ.get("SGLANG_DRAFT_EXTEND_DEBUG"):
+                    logger.warning(
+                        "[RAGGED-PAGED] draft_be=%s q=%s kv=%s "
+                        "prefix=%s no_prefix=%s layer=%s",
+                        getattr(self, "_is_draft_backend", False),
+                        tuple(q.shape),
+                        (tuple(kv_cache[0].shape) if isinstance(kv_cache, tuple)
+                         else tuple(kv_cache.shape)),
+                        (forward_batch.extend_prefix_lens.tolist()
+                         if forward_batch.extend_prefix_lens is not None else None),
+                        self.forward_metadata.extend_no_prefix,
+                        getattr(layer, "layer_id", "?"))
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     kv_cache,
@@ -1784,6 +1839,16 @@ class FlashInferAttnBackend(AttentionBackend):
                     v_scale=layer.v_scale_float,
                 )
 
+                import os as _os_d4
+                if _os_d4.environ.get("SGLANG_DRAFT_EXTEND_DEBUG"):
+                    logger.warning(
+                        "[MERGE] o1=%s s1=%s o2=%s s2=%s prefix=%s no_prefix=%s "
+                        "draft_be=%s", tuple(o1.shape), tuple(s1.shape),
+                        tuple(o2.shape), tuple(s2.shape),
+                        (forward_batch.extend_prefix_lens.tolist()
+                         if forward_batch.extend_prefix_lens is not None else None),
+                        self.forward_metadata.extend_no_prefix,
+                        getattr(self, "_is_draft_backend", False))
                 if sinks is not None:
                     o, lse_merged = _safe_merge_state(o1, s1, o2, s2)
                     o = self._apply_attention_sinks(o, lse_merged, sinks, forward_batch)

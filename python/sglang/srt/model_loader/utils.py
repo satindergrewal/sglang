@@ -355,8 +355,14 @@ def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
         return model.thinker.model
+    # NextN/EAGLE draft models (e.g. MiMoV2ModelNextN) are single-block
+    # wrappers with no .model/.language_model; they ARE the language model
+    # for pool-scale purposes — their mtp_block carries the attention whose
+    # KV scales (if any) the caller walks via named children.
+    if model_cls_name.endswith("ModelNextN") and hasattr(model, "mtp_block"):
+        return model
     if hasattr(model, "model"):
         return model.model
     if hasattr(model, "language_model"):
         return model.language_model
-    return model.model
+    return model

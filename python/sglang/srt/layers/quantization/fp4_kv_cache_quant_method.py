@@ -496,7 +496,9 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         )
 
         attention_layers = []
-        for layer in language_model.layers:
+        # NextN/EAGLE draft models expose a single mtp_block, no .layers —
+        # they carry no per-layer global scales to load.
+        for layer in getattr(language_model, "layers", []) or []:
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
                     attention_layers.append(layer.self_attn.attn)
