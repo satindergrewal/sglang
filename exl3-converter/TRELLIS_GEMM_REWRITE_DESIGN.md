@@ -59,6 +59,27 @@ panels → smem decode → mma) that the scalar path cannot express.
   prefill cells currently run the same kernels); sweep with the A/B harness.
 - **P4 — NVFP4-KV interplay**: none (KV-side, independent).
 
+## 3.5 Split-sweep + the workspace-traffic wall (measured 2026-10-01)
+Serve-skew microbench (8 active experts x 4 pairs, 64MB real traffic):
+splits=4 -> 109.8 µs, splits=8 -> 114.8 µs (no gain), splits=1 -> measured
+worse end-to-end earlier. Explanation: block runtime scales with k/splits,
+but the split-reduction workspace traffic scales UP with splits (each block
+restores/reduces its fp32 (16,128) slab; at splits=8 the extra ~134 MB of
+workspace writes exceeds the 64 MB of useful weight reads). The kernel also
+already amortizes panel decode across a 16-row mma fragment (tensor-core
+mma.m16n8k16 is IN the kernel) — the earlier "pair-major re-read" reading
+was a harness artifact and is withdrawn.
+
+**Next concrete move (requires owner go — invasive kernel change)**: shrink
+the split-reduction workspace slab from (16,128) fp32 to (4,128) fp32 — at
+decode only m<=4 rows are ever real — cutting workspace traffic 4x and
+making splits=16..32 profitable (projected 3-4x on the grouped GEMMs,
+TPOT ~33 -> ~20-24 ms, no-draft ~145-165 tok/s = ~64-72% of native).
+Kernel+runner change (~100 lines: ws shape, block indexing, reduce path),
+full bit-exactness gate required. Note the projected ceiling: even at 72%
+of native, item 1's literal inequality stays unmet — parity requires the
+tensor-core decode path beyond this fix.
+
 ## 4. Risks
 - Fragment layout vs the circular window addressing: the decode's lane-shift
   structure (t_offset = lane<<3 heritage) must be re-derived for the MMA
