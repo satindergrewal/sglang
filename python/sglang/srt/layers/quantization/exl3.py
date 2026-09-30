@@ -1298,6 +1298,10 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         ws_cache = getattr(self, "_grouped_ws", None)
         if ws_cache is None or ws_cache[0] != E:
             ws_cache = self._grouped_ws_make(E, packed)
+            # Persist: without this, _grouped_ws_make's three ~67 MB zeroed
+            # workspaces re-allocate (and re-fill) EVERY MoE layer EVERY step
+            # — ~50% of the whole decode step in kernel time.
+            self._grouped_ws = ws_cache
         _, ws_by, cnt_by = ws_cache
 
         def grouped_gemm(xp, proj, n_out, splits, zero_init=False):
