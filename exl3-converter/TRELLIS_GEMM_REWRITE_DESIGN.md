@@ -36,11 +36,17 @@ FMA chain and, critically, enables multi-stage pipelining (cp.async weight
 panels → smem decode → mma) that the scalar path cannot express.
 
 ## 3. Phase plan (each phase gated)
-- **P0 — reference lock + harness (FIRST TASK)**: `dequant_matrix_orig` +
-  `gate_dequant375.py` give the bit-exactness reference; the microbench
-  harness lineage exists (`bench_exl3_moe_micro.py`) but the per-kernel
-  extension (P ∈ {16..512}, K/N per the 3.75 shapes: K=4096, gate N=4096,
-  down N=4096, I=2048) is P0's deliverable, not yet written.
+- **P0 — reference lock + harness (MEASURED 2026-10-01)**:
+  `p0_microbench.py` (committed) times grouped_linear at the exact 3.75
+  shapes. Headline: the kernel streams at ~1.6 TB/s effective (uniform:
+  536.9 MB / 333.8 µs at P=32) — streaming efficiency is NOT the gap. The
+  measured waste is **pair-major weight re-reads** (~4x amplification at
+  decode skew: each expert panel re-read per pair). P0' (new first task):
+  expert-major M<=4 tiling — decode each 16x16 panel tile ONCE and apply it
+  to all pairs of that expert (register-resident activations) — a moderate
+  change to the existing kernel, projected ~2x on the grouped GEMMs before
+  any tensor-core work. The MMA path (P1/P2 below) follows if P0' lands and
+  the residual still justifies it.
 - **P1 — dense kernel MMA** (`exl3_gemm_kernel_v2`): single-matrix, no
   grouped indirection — the simplest tensor-core win (5.3 ms/step baseline).
   Gate: bit-exact vs P0 on sampled layers; microbench ≥2× at M≤64; then
