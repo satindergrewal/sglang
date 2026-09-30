@@ -618,19 +618,12 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # target-scale indices: garbage at best, illegal access at worst.
         # The draft pool starts empty for this request, so the draft extend
         # must process exactly the new tokens with prefix 0.
-        # ForwardBatch.init_new derives extend_prefix_lens from
-        # batch.prefix_lens (not batch.extend_prefix_lens) — zero THAT, or the
-        # draft extend's paged wrapper plans over radix-prefix slots whose
-        # full->swa entries are the -1 sentinel in the draft pool.
-        pl = getattr(batch, "prefix_lens", None)
-        if pl is not None:
-            batch.prefix_lens = [0] * len(pl)
-        if getattr(batch, "prefix_lens_cpu", None) is not None:
-            batch.prefix_lens_cpu = [0] * len(batch.prefix_lens_cpu)
-        if getattr(batch, "extend_prefix_lens", None) is not None:
-            batch.extend_prefix_lens = [0] * len(batch.extend_prefix_lens)
-        if getattr(batch, "extend_prefix_lens_cpu", None) is not None:
-            batch.extend_prefix_lens_cpu = [0] * len(batch.extend_prefix_lens_cpu)
+        # NOTE: prefix lenses must stay TRUE here. The draft extend's q rows
+        # are exactly the extend tokens, and the ragged qo_indptr is built as
+        # cumsum(seq_lens - prefix_lens) — zeroing the prefix over-counts q by
+        # the cached prefix. The prefix region is handled in the attention
+        # backend instead: draft pools have no KV for those slots, so the
+        # draft extend runs ragged-only (see _draft_force_ragged handling).
 
         # Draft-extend spec_info for the extend forward; carries only
         # hidden_states + shape info.

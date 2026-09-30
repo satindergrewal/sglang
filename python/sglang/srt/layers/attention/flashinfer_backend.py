@@ -1228,10 +1228,12 @@ class FlashInferAttnBackend(AttentionBackend):
 
             # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
             if self._draft_force_ragged:
+                # Draft pools hold no KV for radix-cached prefix slots (their
+                # full->swa entries are the -1 sentinel), so the draft extend
+                # attends ragged-only over exactly the extend rows; the qo
+                # indptr still comes from the TRUE prefix lens.
                 use_ragged = True
-                extend_no_prefix = not any(
-                    forward_batch.extend_prefix_lens_cpu or []
-                )
+                extend_no_prefix = True
             elif self.is_multimodal or self.enable_mis:
                 # use_ragged = False: Multi-item scoring requires the paged wrapper because:
                 # 1. Ragged wrapper doesn't support the specialized multi-item parameters
@@ -2360,12 +2362,19 @@ class FlashInferIndicesUpdaterPrefill:
     ):
         if use_ragged:
             assert prefix_lens is not None
-            paged_kernel_lens = prefix_lens
-            if extend_prefix_lens_cpu is not None:
-                # Host-known prefix lens; avoids a per-step D2H sync.
-                paged_kernel_lens_sum = sum(extend_prefix_lens_cpu)
+            if getattr(self.attn_backend, "_draft_force_ragged", False):
+                # Draft pools have no radix-prefix KV: plan an empty paged
+                # side; the ragged side covers the extend rows (qo indptr is
+                # built from the TRUE prefix lens inside call_begin_forward).
+                paged_kernel_lens = torch.zeros_like(prefix_lens)
+                paged_kernel_lens_sum = 0
             else:
-                paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+                paged_kernel_lens = prefix_lens
+                if extend_prefix_lens_cpu is not None:
+                    # Host-known prefix lens; avoids a per-step D2H sync.
+                    paged_kernel_lens_sum = sum(extend_prefix_lens_cpu)
+                else:
+                    paged_kernel_lens_sum = paged_kernel_lens.sum().item()
         else:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
@@ -2451,18 +2460,27 @@ class FlashInferIndicesUpdaterPrefill:
             swa_paged_custom_mask = None
             if wrapper_id == 0:
                 if use_ragged:
-                    # K for extend tokens is written after the paged wrapper runs, so
-                    # the paged wrapper sees prefix-only. Trim to the last `window` tokens
-                    # (required for SWATokenToKVPoolAllocator; also keeps mask O(window)).
-                    effective_start = torch.clamp(
-                        prefix_lens - sliding_window_size, min=0
-                    )
-                    paged_kernel_lens = prefix_lens - effective_start
-                    paged_kernel_lens_sum = paged_kernel_lens.sum().item()
-                    kv_start_idx = effective_start
-                    swa_paged_custom_mask = self._build_swa_prefix_custom_mask(
-                        prefix_lens, seq_lens, effective_start
-                    )
+                    if getattr(self.attn_backend, "_draft_force_ragged", False):
+                        # Draft pools have no radix-prefix KV: empty paged
+                        # side; the ragged rows (qo from TRUE prefix lens)
+                        # carry the whole draft-extend attention.
+                        paged_kernel_lens = torch.zeros_like(prefix_lens)
+                        paged_kernel_lens_sum = 0
+                        kv_start_idx = torch.zeros_like(prefix_lens)
+                        swa_paged_custom_mask = None
+                    else:
+                        # K for extend tokens is written after the paged wrapper runs, so
+                        # the paged wrapper sees prefix-only. Trim to the last `window` tokens
+                        # (required for SWATokenToKVPoolAllocator; also keeps mask O(window)).
+                        effective_start = torch.clamp(
+                            prefix_lens - sliding_window_size, min=0
+                        )
+                        paged_kernel_lens = prefix_lens - effective_start
+                        paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+                        kv_start_idx = effective_start
+                        swa_paged_custom_mask = self._build_swa_prefix_custom_mask(
+                            prefix_lens, seq_lens, effective_start
+                        )
                 else:
                     # window attention use paged only; the trim below is
                     # request-granular, exactness comes from plan-time window_left
