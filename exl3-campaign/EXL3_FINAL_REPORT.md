@@ -143,12 +143,24 @@ splits=4 retained (A/B documented in-code, commit cc2bacc48a). The remaining
 gap is the trellis inner-loop decode cost per weight tile — a tensor-core-
 class kernel rewrite, the next campaign's opening item.
 
-**Item-1 note**: the literal "EXL3 >= native in every cell" is not met
-numerically (EXL3 at 44-48% of native in fp8, 47-79% in nvfp4). What IS
-delivered: the gap decomposed to named, measured kernels with every cheap
-lever exhausted (four levers tried, two shipped, one negative-documented),
-plus the tooling to iterate. Closing it to parity is a dedicated
-trellis-GEMM kernel-rewrite campaign — an owner decision on scope.
+**Item-1 disposition (DECISION REQUESTED FROM OWNER — PENDING)**: the
+literal "EXL3 >= native in every cell" is not met numerically (EXL3 at
+44-48% of native in fp8, 47-79% in nvfp4). What IS delivered: the gap
+decomposed to named, measured kernels with every cheap lever exhausted
+(four levers tried, two shipped, one negative-documented), plus the tooling
+to iterate. The decision between (a) accepting this attribution arm as
+item 1's outcome and (b) authorizing a dedicated trellis-GEMM
+kernel-rewrite campaign (tensor-core-class decode path for
+exl3_grouped_gemm_kernel_v2) was put to the owner explicitly on 2026-10-01
+and is AWAITING ANSWER — neither option is taken as granted. Note that the
+owner's own mission text pre-authorizes the attribution arm for item 3
+("or the residual gap is attributed to named, measured components"); this
+report records the matrix as MEASURED (item 1's measurement requirement,
+code and prose separate) with the inequality outcome standing as data until
+the owner rules. Both paths remain open and fully prepared: the attribution
+record is this section; the rewrite campaign's opening state is the profile
+tooling, the per-kernel baselines, and the A/B methodology on the
+exl3-campaign-docs branch.
 ## 6. Converter durability (DONE)
 - `sglang-vendorport/exl3-converter/float_k_casts.patch` — int(K) casts at
   the ext boundaries (get_temp_buffers / quantize_tiles_scratch /
