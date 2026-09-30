@@ -1260,6 +1260,29 @@ class FlashInferAttnBackend(AttentionBackend):
             self._prepare_dequant_workspace_metadata_for_extend(
                 forward_batch, use_ragged
             )
+            # NVFP4 KV + hybrid SWA: the SWA layers' paged prefix reads come
+            # from the b-side (SWA-pool) dequant workspace; stash its gather
+            # plan here exactly as the decode-as-extend branch does, so any
+            # extend-mode caller (e.g. DFlash draft extends) that later
+            # requests the b-side view finds a plan. The plan is -1-safe
+            # (evicted/unwritten SWA slots are masked via valid_parts).
+            if (
+                self.prefill_uses_dequant_workspace
+                and self.token_to_kv_pool.__class__.__name__ == "SWAKVPool"
+            ):
+                seq_lens_cpu_e = (
+                    forward_batch.seq_lens_cpu
+                    if forward_batch.seq_lens_cpu is not None
+                    else forward_batch.seq_lens.cpu().tolist()
+                )
+                self.dq_swa_page_table, self.dq_swa_paged_kernel_lens = (
+                    self.token_to_kv_pool.prepare_swa_dequant_workspace(
+                        self.req_to_token_pool.req_to_token,
+                        forward_batch.req_pool_indices.cpu().tolist(),
+                        seq_lens_cpu_e,
+                        self.sliding_window_size,
+                    )
+                )
 
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
