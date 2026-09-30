@@ -43,6 +43,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
 )
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+)
 from sglang.srt.runtime_context import (
     get_device,
     get_parallel,
@@ -586,6 +590,19 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
 
+    def _draft_forward_ctx(self, step: int):
+        """Publish the draft runner's own attention-backend context.
+
+        The draft passes run NESTED inside the target's scheduler pass, so the
+        ambient ForwardContext still holds the TARGET backend; _forward_raw's
+        has_forward_context() shortcut then lets the draft layers resolve
+        attention through the target's backend and metadata (wrong KV pool,
+        wrong wrapper plan). Publish the draft runner's backend explicitly.
+        """
+        return forward_context(
+            ForwardContext(attn_backend=self.draft_runner_list[step].attn_backend)
+        )
+
     def _draft_extend_for_prefill(
         self,
         batch: ScheduleBatch,
@@ -680,9 +697,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             # DP/MLP-sync padding mutates ForwardBatch fields in place. Keep
             # those per-runner mutations from leaking into the next MTP step.
             step_forward_batch = replace(forward_batch)
-            output: ModelRunnerOutput = self.draft_runner_list[step].forward(
-                step_forward_batch
-            )
+            with self._draft_forward_ctx(step):
+                output: ModelRunnerOutput = self.draft_runner_list[step].forward(
+                    step_forward_batch
+                )
             maybe_detect_nan(
                 output.logits_output.next_token_logits,
                 f"draft_extend_for_prefill step {step}",
@@ -954,9 +972,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     self.draft_runner_list[step].attn_backend.init_forward_metadata(
                         forward_batch
                     )
-                draft_logits_output = self.draft_runner_list[step].forward(
-                    forward_batch
-                )
+                with self._draft_forward_ctx(step):
+                    draft_logits_output = self.draft_runner_list[step].forward(
+                        forward_batch
+                    )
                 if prune_logits:
                     logits_sel = draft_logits_output.logits_output.next_token_logits
                 else:
