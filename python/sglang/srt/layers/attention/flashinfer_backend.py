@@ -2212,6 +2212,15 @@ class FlashInferIndicesUpdaterDecode:
                     kv_indices[:kv_last_index]
                 )
             )
+            # Draft pools never receive KV for radix-cached prefix slots:
+            # their full->swa entries are the -1 sentinel, and a -1 index in
+            # the paged kernel reads kv_cache[-1] (negative OOB -> illegal
+            # access). Point them at slot 0 — in-bounds garbage instead of a
+            # fault. Draft backends only; target-pool entries always exist.
+            if getattr(self.attn_backend, "_draft_force_ragged", False):
+                negs = kv_indices[:kv_last_index] < 0
+                if negs.any():
+                    kv_indices[:kv_last_index][negs] = 0
 
         global global_override_indptr_cpu
         locally_override = False
@@ -2810,6 +2819,13 @@ class FlashInferIndicesUpdaterPrefill:
                     kv_indices[:kv_last_index]
                 )
             )
+            # Draft-pool -1 sentinels (radix-cached prefix slots the draft
+            # pool never wrote) must not reach the paged kernel: kv_cache[-1]
+            # is a negative-OOB read. Point them at slot 0. Draft only.
+            if getattr(self.attn_backend, "_draft_force_ragged", False):
+                negs = kv_indices[:kv_last_index] < 0
+                if negs.any():
+                    kv_indices[:kv_last_index][negs] = 0
 
         # cached part
         # Conditionally set multi-item parameters
