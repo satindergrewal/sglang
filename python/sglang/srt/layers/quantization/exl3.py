@@ -367,6 +367,7 @@ class MoEGroupedOverflow(Exception):
     """Pair count exceeds the grouped kernel's per-pass capacity."""
 
 _GROUPED_WS_CACHE: dict = {}
+_DIRECT_SCRATCH_CACHE: dict = {}
 
 try:
     _HAS_HAD_IN_PAIRS = hasattr(torch.ops.sgl_exl3_grouped, "grouped_had_in_pairs")
@@ -1205,6 +1206,16 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         torch.ops.sgl_kernel.sgl_exl3_linear(xh, trellis, svh, bias, cb, out)
         return out
 
+    def _direct_scratch(self, dev, n):
+        """Cached (64, n) fp32 atomic-accumulation scratch for the direct
+        decode path (P <= 64 eager). Zeroed by the caller per launch."""
+        key = (str(dev), n)
+        buf = _DIRECT_SCRATCH_CACHE.get(key)
+        if buf is None:
+            buf = torch.zeros(64, n, dtype=torch.float32, device=dev)
+            _DIRECT_SCRATCH_CACHE[key] = buf
+        return buf
+
     def _grouped_ws_make(self, E, packed, splits=4, rows=16, chunks=4):
         """Persistent grouped-kernel workspaces keyed by (projection,
         col_blocks). rows = ws slab rows (16 full / 4 decode variant);
@@ -1261,7 +1272,7 @@ class ExL3MoEMethod(FusedMoEMethodBase):
                 wts.reshape(-1).to(torch.float32).contiguous(),
                 E, K, wscale, x_pairs, pw)
             if (not torch.cuda.is_current_stream_capturing()
-                    and int(counts[:E].max().item()) > rows * chunks):
+                    and int(counts[:E].max().item()) > (32 if use_direct else rows * chunks)):
                 raise MoEGroupedOverflow()
             CH = 4
         else:
@@ -1294,7 +1305,7 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             # SORTED order (pw is wts[order]); sids == key[order].
             pw = torch.where(sids < E, pw, torch.zeros_like(pw))
             if (not torch.cuda.is_current_stream_capturing()
-                    and int(counts[:E].max().item()) > rows * chunks):
+                    and int(counts[:E].max().item()) > (32 if use_direct else rows * chunks)):
                 raise MoEGroupedOverflow()
 
             CH = 4
@@ -1314,7 +1325,8 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         # in-place). Eager-only: the overflow check needs a host sync, and
         # captured graphs must keep the rows=16 worst-case layout.
         capturing = torch.cuda.is_current_stream_capturing()
-        if P <= 64 and not capturing:
+        use_direct = P <= 64 and not capturing
+        if use_direct:
             rows, chunks, splits_v = 4, 8, 16
         else:
             rows, chunks, splits_v = 16, 4, 4
@@ -1332,6 +1344,20 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         _, ws_by, cnt_by = ws_cache
 
         def grouped_gemm(xp, proj, n_out, splits, zero_init=False):
+            if use_direct:
+                # Direct decode path: atomic-split partials into a zeroed
+                # fp32 scratch + fused epilogue; no workspace round-trip.
+                # Capacity 32 pairs/expert (G=2) — gated by the overflow
+                # checks above; zero_init is inherent (scratch.zero_()).
+                scratch = self._direct_scratch(dev, n_out)
+                scratch.zero_()
+                out = torch.empty((xp.shape[0], n_out), dtype=out_dt, device=dev)
+                torch.ops.sgl_exl3_grouped.grouped_linear_direct(
+                    xp, packed[f"{proj}_ptrs"], packed[f"{proj}_svh_ptrs"],
+                    packed[f"{proj}_bias_ptrs"], counts, offsets,
+                    packed[f"{proj}_cb"], packed[f"{proj}_bits"],
+                    int(packed[f"{proj}_half_k"]), splits_v, scratch, out)
+                return out
             cb_n = int(n_out // 128)
             ws = ws_by[(proj, cb_n)]
             cnt = cnt_by[(proj, cb_n)]
