@@ -1205,7 +1205,7 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         torch.ops.sgl_kernel.sgl_exl3_linear(xh, trellis, svh, bias, cb, out)
         return out
 
-    def _grouped_ws_make(self, E, packed):
+    def _grouped_ws_make(self, E, packed, splits=4):
         """Persistent grouped-kernel workspaces keyed by (projection,
         col_blocks); sized for the worst case (CH=4 chunks). Zeros are
         restored in-kernel after each launch, so reuse is graph-safe."""
@@ -1213,7 +1213,6 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         down_n = packed["down_n"]
         dev = packed["gate_ptrs"].device
         CH = 4
-        splits = 4
         ws_by = {}
         cnt_by = {}
         for proj, n_out in (("gate", gate_n), ("up", gate_n), ("down", down_n)):
@@ -1237,6 +1236,11 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         rsf = runner_config.routed_scaling_factor
         wscale = comp * (rsf if rsf is not None else 1.0)
         dev = x.device
+        # Adaptive splits: the grouped grid is (col_blocks, splits, E*CH) —
+        # at decode P is tiny (bs x topk) and E*CH z-blocks are mostly empty,
+        # so block dispatch dominates (~152 us/launch at splits=4). Quarter
+        # the grid at small P; large-P (prefill) keeps the k-parallel splits.
+        splits = 4 if P > 256 else 1
         if _HAS_FUSED_ROUTE and P <= 512 and os.environ.get("EXL3_MOE_NO_FUSED_ROUTE") != "1":
             # Two-launch fused routing (single-block bitonic sort + gather
             # grid). Replaces ~10 tiny torch kernels (~80us of launch
@@ -1297,16 +1301,17 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             CH = 4
         # Persistent per-layer workspace/counters (fixed shapes): avoids
         # several GB of alloc/free per pass; zeros are restored in-kernel.
-        # ONE shared workspace set per (E, gate_n, down_n, device) across all
-        # MoE layers: the shapes are layer-identical. Per-layer persistence
-        # (47 x ~200 MB) OOMs the KV pool, while per-step allocation re-fills
-        # ~200 MB of zeros every layer every step (~50% of the decode step in
-        # GPU kernel time). The kernels restore the workspace zeros in-place
-        # after each launch, so sharing/reuse is graph-safe.
-        key = (E, packed["gate_n"], packed["down_n"], packed["gate_ptrs"].device.index)
+        # ONE shared workspace set per (E, gate_n, down_n, splits, device)
+        # across all MoE layers: the shapes are layer-identical. Per-layer
+        # persistence (47 x ~200 MB) OOMs the KV pool, while per-step
+        # allocation re-fills ~200 MB of zeros every layer every step (~50%
+        # of the decode step in GPU kernel time). The kernels restore the
+        # workspace zeros in-place after each launch, so sharing/reuse is
+        # graph-safe.
+        key = (E, packed["gate_n"], packed["down_n"], splits, packed["gate_ptrs"].device.index)
         ws_cache = _GROUPED_WS_CACHE.get(key)
         if ws_cache is None:
-            ws_cache = self._grouped_ws_make(E, packed)
+            ws_cache = self._grouped_ws_make(E, packed, splits)
             _GROUPED_WS_CACHE[key] = ws_cache
         _, ws_by, cnt_by = ws_cache
 
@@ -1352,8 +1357,8 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             and not getattr(self, "_probe_done", False)
         )
         act = runner_config.activation
-        o_g = grouped_gemm(xh_gate, "gate", packed["gate_n"], 4)
-        o_u = grouped_gemm(xh_up, "up", packed["gate_n"], 4)
+        o_g = grouped_gemm(xh_gate, "gate", packed["gate_n"], splits)
+        o_u = grouped_gemm(xh_up, "up", packed["gate_n"], splits)
         if act == "silu":
             mid = (F.silu(o_g.float()) * o_u.float()).to(out_dt)
         elif act == "gelu":
@@ -1372,7 +1377,7 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         mid = mid_t        # Down projection: pair rows reach the combine. Output pre-zeroed so
         # rows the kernel did not process (zero-count experts, overflow,
         # sentinel) contribute nothing — no CPU-side staging needed.
-        o_d = grouped_gemm(mid, "down", packed["down_n"], 4, zero_init=True)
+        o_d = grouped_gemm(mid, "down", packed["down_n"], splits, zero_init=True)
         out = torch.zeros((x.shape[0], packed["down_n"]),
                           dtype=torch.float32, device=dev)
         out.index_add_(0, tok, o_d.float() * pw[:, None].to(out.dtype))
