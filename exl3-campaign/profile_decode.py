@@ -25,7 +25,11 @@ def http_post(url, payload=None):
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=600) as r:
-        return json.loads(r.read() or b"{}")
+        body = r.read() or b"{}"
+        try:
+            return json.loads(body)
+        except Exception:
+            return {"text": body.decode(errors="replace")[:200]}
 
 def http_get(url):
     with urllib.request.urlopen(url, timeout=600) as r:

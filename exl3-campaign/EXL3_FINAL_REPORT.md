@@ -47,29 +47,35 @@ Images: `exl3-grouped-20260928n` = 136e18747603 (daily), `exl3-grouped-20260928p
 | Native no-draft | vendorbase g1y6 | mem 0.88, kv fp8_e4m3, --moe-runner-backend flashinfer_mxfp4 | (fill) |
 | Native DFlash / EAGLE | same | + drafter flags as above | (fill) |
 
-(Exact pool numbers get copied from the boot logs into the final table when
-the boxes return; the campaign numbers above are from the journal.)
+Measured pools (2026-10-01): EXL3 no-draft 241,902 @0.85 | native no-draft
+93,031 @0.89 (native is weights-bound: ~90 GB/GPU) | EXL3 DFlash 180,387 |
+native DFlash 46,515 | EXL3 EAGLE 142,785 | native EAGLE 17,894 | the nvfp4
+variants carry the same pools per drafter. EXL3 cells: image 28u; native:
+28v; the daily is `boot_fallback_shm.sh` (SHM env is mandatory on this box —
+see §7).
 
 ## 3. The measured matrix — 111 protocol
 `sglang.bench_serving --backend sglang-oai-chat --random-input-len 256
 --random-output-len 64 --num-prompts 16 --max-concurrency 4`
 
-### 3.1 fp8 KV row (COMPLETE)
+### 3.1 fp8 KV row (MEASURED 2026-10-01, SHM transport, images 28t/u/v)
 | Drafter | native tok/s | EXL3-3.75 tok/s | EXL3/native |
 |---|---|---|---|
-| none | 67.2 | 52.7 | 78% |
-| DFlash2 (block 7) | 147.5 | 96.25 | 65% |
-| EAGLE 3/1/4 (radix OFF) | 185.98 | 62.58 | 34% |
+| none | 227.06 | 98.97 | 43.6% |
+| DFlash2 (block 7) | 288.52 | 126.69 | 43.9% |
+| EAGLE 3/1/4 (radix ON) | 171.95 | 81.47 | 47.4% |
 
-### 3.2 nvfp4 KV row (PENDING — box)
-Cells: none / DFlash2 / EAGLE × native / EXL3. Known-good code path exists
-(verify×nvfp4 workspace chain fixed; native DFlash nvfp4 = 147.5-class
-measured earlier). EXL3-side nvfp4 cells never benched.
+### 3.2 nvfp4 KV row (MEASURED 2026-10-01, SHM transport)
+| Drafter | native tok/s | EXL3-3.75 tok/s | EXL3/native |
+|---|---|---|---|
+| none | 63.91 | 50.40 | 78.9% |
+| DFlash2 (block 7, fp8 draft KV) | 252.82 | 118.75 | 47.0% |
+| EAGLE 3/1/4 (radix ON) | 96.73 | 69.36 | 71.7% |
 
-### 3.3 EAGLE with radix cache ON (PENDING — box)
-The 3.1 EAGLE cells ran with --disable-radix-cache (mitigation for the race,
-§5). With the §5 fix (image 28p) the radix-ON cells must be re-benched; if
-stable, the matrix numbers above get superseded by radix-ON numbers.
+### 3.3 EAGLE with radix cache ON — FIXED AND MEASURED
+Both targets bench 16/16 with ZERO exceptions with radix ON (the fix stack:
+context publish + ragged-only draft extends + -1 clamps). The numbers above
+ARE the radix-ON cells; no --disable-radix-cache mitigation is used anymore.
 
 ## 4. EAGLE draft-extend race — root cause and fix
 - Symptom: deterministic MergeState / BatchPrefillWithPagedKVCache illegal
@@ -94,15 +100,37 @@ stable, the matrix numbers above get superseded by radix-ON numbers.
   (garbage values, degraded acceptance) — the radix-ON coherence test on the
   box decides whether a decode-side guard is also needed.
 
-## 5. Decode-step profile (~100 ms EXL3 decode step) — decomposition (PENDING — box)
-MoE exonerated earlier (kernel chain: pairs had_in 139.5→6.3 µs, fused
-routing 80→26 µs, full MoE chain 973→704 µs; NCU shows the GEMM
-compute-bound, SM 59% / DRAM 25%, register-limited; rreg sweep gave 4–9%).
-Remaining decomposition: attention vs dense-projections vs NCCL vs sampler,
-native-vs-EXL3 per component. Profile scripts to run: torch profiler on the
-decode step at bs≈4, one pass per target (native serve vs EXL3 serve),
-diff at component level. Scripts prepared in §8.
+## 5. Decode-step profile — decomposition (DONE 2026-10-01)
+Torch-profiler capture via /start_profile, kernel-class aggregation
+(`profile_decode.py` + `trace_grid/corr/ctx.py`), EXL3 no-draft serve,
+111-shaped decode load:
 
+Before the workspace fix (28s era):
+  GPU kernel total 5822 ms: **FillFunc 2923 ms (50.2%)** — `torch.zeros` from
+  `_grouped_ws_make`, never cached (three ~67 MB zeroed workspaces re-filled
+  per MoE layer per step); trellis GEMMs ~35%; NCCL(SHM) 10.2%; attention 0.4%.
+Fix: shared module-level workspace cache (one set per (E, gate_n, down_n,
+device) across all 47 MoE layers). Per-layer persistence OOMed the pool;
+per-step allocation was the 50% fill.
+
+After (28t):
+  GPU kernel total 3550 ms (-39%): trellis GEMMs **79.7%** (grouped MoE
+  1432+430 ms + dense exl3_gemm 530 ms + hadamard/route), NCCL(SHM) 9.4%,
+  quant/elementwise 6.3%, attention 0.9%, fills GONE.
+
+Effect: EXL3 no-draft 52.83 → 98.97 tok/s (+87%), TPOT 62.25 → 33.01 ms;
+EAGLE 60.26 → 81.47; DFlash 126.69.
+
+**Named residual gap (item 3 attribution arm)**: the remaining EXL3 step is
+~80% trellis dequant-GEMM kernel time — the compute-bound, register-limited
+path NCU documented (SM 59%, DRAM 25%) — versus the native's fp8
+cuBLAS/flashinfer GEMM path (TPOT 14.3 ms at the same load). Closing it
+further is deep kernel engineering (register allocation / tiling for the
+trellis GEMMs), out of this session's scope; the profile tooling and the
+decomposition above are the baseline for that work. All numbers carry the
+SHM-transport caveat (this box's P2P is hardware-faulted; NCCL runs
+P2P_DISABLE=1 SHM staging on both sides, so the EXL3-vs-native comparison is
+transport-fair).
 ## 6. Converter durability (DONE)
 - `sglang-vendorport/exl3-converter/float_k_casts.patch` — int(K) casts at
   the ext boundaries (get_temp_buffers / quantize_tiles_scratch /
@@ -118,14 +146,16 @@ diff at component level. Scripts prepared in §8.
   keys; registry entry restored.
 
 ## 7. Infrastructure state
-- Box (192.168.0.101): GPU-to-GPU P2P wedged by Xid 13/43 during the
-  compute-sanitizer run (2026-09-30). Survives warm reboot, kernel switch
-  (31↔34), nvidia-smi -r, PCIe remove/rescan, ACS clear. Everything else
-  works (single-GPU compute, same-GPU multi-rank NCCL, CE copies, pinned
-  DMA). Needs a COLD POWER CYCLE. Recovery after power-up:
-  `/mnt/nvme0/work-exl3/boot_daily375.sh` restores the 8015 daily;
-  `boot_eagle28p.sh` runs the EAGLE fix test. Grub pinned to kernel
-  7.0.0-31 (kernel 34 was a red herring; note in /root/KERNEL_NOTE.txt).
+- Box (192.168.0.101): GPU-to-GPU P2P was wedged by Xid 13/43 during the
+  compute-sanitizer run (2026-09-30); the wedge SURVIVED the cold power
+  cycle (2026-10-01) — a persistent hardware-level fault in the SM-initiated
+  peer path. The campaign runs on the NCCL SHM fallback
+  (`NCCL_P2P_DISABLE=1 NCCL_P2P_LEVEL=LOC NCCL_CUMEM_ENABLE=0`; the earlier
+  `NCCL_P2P=0/DISABLE` knobs were invalid names NCCL silently ignored).
+  Everything else works (single-GPU compute, same-GPU multi-rank NCCL, CE
+  copies, pinned DMA). The P2P path may need hardware attention (BIOS/PCIe/
+  RMA territory); until then `boot_fallback_shm.sh` is THE daily launcher.
+  Grub pinned to kernel 7.0.0-31.
 - Fork pushes: `satindergrewal/sglang` branches `nvfp4-report`
   (through 66272dc54c) and `exl3-native-support` (f2528b3459). Nothing
   upstream/public.
