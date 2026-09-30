@@ -133,6 +133,13 @@ diff at component level. Scripts prepared in §8.
   native-drafter subset copied for TP1 smoke tests while the box is down.
 
 ## 8. Session runbook (next box session)
+0. **If 2-rank NCCL still hangs at "Init parallel begin" after the cold
+   cycle:** relaunch with `boot_fallback_shm.sh` — docker env
+   `NCCL_P2P_DISABLE=1 NCCL_CUMEM_ENABLE=0` forces SHM staging through host
+   memory (the copy-engine path is proven healthy). NOTE: earlier "P2P
+   disabled still hangs" evidence was invalid — `NCCL_P2P=0/DISABLE` are not
+   valid NCCL 2.30 knobs and were silently ignored; the SHM path is untested.
+   Numbers taken under SHM transport get a transport caveat in §3.
 1. Power-cycle box → `boot_daily375.sh` → verify "Paris" → pool number.
 2. `boot_eagle28p.sh` → coherence + 111 bench EAGLE radix-ON (EXL3 cell).
    If coherent: re-run native EAGLE radix-ON. If garbage (decode-path
