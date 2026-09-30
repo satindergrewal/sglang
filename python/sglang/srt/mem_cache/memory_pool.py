@@ -2928,14 +2928,15 @@ class MHATokenToKVPool(KVCache):
         )
         dq_k[row:row_end] = k_fp8
         dq_v[row:row_end] = v_fp8
-        if not bool(valid.all().item()):
-            # Evicted SWA slots (-1) contribute nothing: zero their rows.
-            dq_k[row:row_end] = torch.where(
-                valid.unsqueeze(-1), dq_k[row:row_end], torch.zeros_like(dq_k[row:row_end])
-            )
-            dq_v[row:row_end] = torch.where(
-                valid.unsqueeze(-1), dq_v[row:row_end], torch.zeros_like(dq_v[row:row_end])
-            )
+        # Evicted SWA slots (-1) contribute nothing: zero their rows. Applied
+        # unconditionally and device-side — a valid.all().item() host sync is
+        # illegal inside CUDA graph capture (cudaErrorStreamCaptureUnsupported).
+        dq_k[row:row_end] = torch.where(
+            valid.unsqueeze(-1), dq_k[row:row_end], torch.zeros_like(dq_k[row:row_end])
+        )
+        dq_v[row:row_end] = torch.where(
+            valid.unsqueeze(-1), dq_v[row:row_end], torch.zeros_like(dq_v[row:row_end])
+        )
 
     def get_flashinfer_decode_dequant_workspace_kv_buffer(
         self,
