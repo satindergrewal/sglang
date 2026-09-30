@@ -610,6 +610,19 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             "draft_extend_for_prefill: next_token_ids before draft embed",
         )
 
+        # The draft KV pool has no KV for radix-cached prefix tokens (the
+        # radix cache only stores target-pool KV, and the draft workers share
+        # the target's req_to_token_pool — whose entries are target-pool
+        # indices). Feeding the target's radix-matched prefix lens into the
+        # draft extend makes its paged attention index the draft pool with
+        # target-scale indices: garbage at best, illegal access at worst.
+        # The draft pool starts empty for this request, so the draft extend
+        # must process exactly the new tokens with prefix 0.
+        if batch.extend_prefix_lens is not None:
+            batch.extend_prefix_lens = [0] * len(batch.extend_prefix_lens)
+        if getattr(batch, "extend_prefix_lens_cpu", None) is not None:
+            batch.extend_prefix_lens_cpu = [0] * len(batch.extend_prefix_lens_cpu)
+
         # Draft-extend spec_info for the extend forward; carries only
         # hidden_states + shape info.
         extend_input = EagleDraftExtendInput(
