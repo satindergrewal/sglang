@@ -1241,6 +1241,7 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         # mostly-empty E*CH z-blocks are cheap to dispatch; the cost is the
         # expert-major weight streaming inside the active blocks, which needs
         # the k-parallel splits for occupancy.
+        splits = 4
         if _HAS_FUSED_ROUTE and P <= 512 and os.environ.get("EXL3_MOE_NO_FUSED_ROUTE") != "1":
             # Two-launch fused routing (single-block bitonic sort + gather
             # grid). Replaces ~10 tiny torch kernels (~80us of launch
