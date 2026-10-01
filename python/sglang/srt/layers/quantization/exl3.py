@@ -1265,7 +1265,8 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         # The direct kernel is capture-safe (dynamic group loop, no host
         # syncs, self-cleaning scratch); the P<=64 bound limits it to decode
         # shapes where it wins — larger P stays on the v2 split path.
-        use_direct = (P <= 64
+        panel_b = os.environ.get("EXL3_PANEL_LAYOUT") == "B"
+        use_direct = (P <= 64 and panel_b
                       and os.environ.get("EXL3_MOE_NO_DIRECT") != "1")
         if use_direct:
             rows, chunks, splits_v = 4, 8, 16
@@ -1365,6 +1366,16 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             _, ws_by, cnt_by = ws_cache
 
         def grouped_gemm(xp, proj, n_out, splits, zero_init=False):
+            if use_direct and panel_b:
+                # Layout-B direct: the contiguous-panel kernel
+                scratch = self._direct_scratch(dev, n_out)
+                scratch.zero_()
+                out = torch.zeros((xp.shape[0], n_out), dtype=out_dt, device=dev)
+                torch.ops.sgl_exl3_grouped.grouped_linear_direct_b(
+                    xp, packed[f"{proj}_ptrs"], counts, offsets,
+                    packed[f"{proj}_cb"], packed[f"{proj}_bits"],
+                    int(packed[f"{proj}_half_k"]), splits_v, scratch, out)
+                return out
             if use_direct:
                 # Direct decode path: atomic-split partials into a zeroed
                 # fp32 scratch + fused epilogue; no workspace round-trip.
