@@ -1372,7 +1372,8 @@ class ExL3MoEMethod(FusedMoEMethodBase):
                 scratch.zero_()
                 out = torch.zeros((xp.shape[0], n_out), dtype=out_dt, device=dev)
                 torch.ops.sgl_exl3_grouped.grouped_linear_direct_b(
-                    xp, packed[f"{proj}_ptrs"], counts, offsets,
+                    xp, packed[f"{proj}_ptrs"], packed[f"{proj}_svh_ptrs"],
+                    packed[f"{proj}_bias_ptrs"], counts, offsets,
                     packed[f"{proj}_cb"], packed[f"{proj}_bits"],
                     int(packed[f"{proj}_half_k"]), splits_v, scratch, out)
                 return out
