@@ -296,9 +296,12 @@ __global__ void exl3_grouped_gemm_direct(
     // The last grid-y slot is the routing sentinel (remote pairs, NULL
     // panels): never dereference it.
     if (e == gridDim.y - 1) return;
-    // G=2: up to 32 pairs of this expert share ONE decoded weight tile per
-    // k-window (halves the decode chain's per-row cost vs the 16-row variant).
-    int m = cnt; if (m > 2 * ROWS_PER_PASS) m = 2 * ROWS_PER_PASS;
+    // Dynamic pair-groups (graph-safe: the trip count reads device memory at
+    // replay). Groups OUTER, k INNER: each group re-reads its panel slice,
+    // which L2 serves after the first group — the decode chain runs once per
+    // group with full register reuse, no fixed capacity, no host overflow
+    // checks.
+    int m = cnt;
     const int groups = (m + ROWS_PER_PASS - 1) / ROWS_PER_PASS;
     const int k16 = k >> 4;
     const int k_beg = (int)((long)k16 * ks / splits);
@@ -330,49 +333,47 @@ __global__ void exl3_grouped_gemm_direct(
         }
     }
 
-    FragC frag_c[4];
-#pragma unroll
-    for (int g = 0; g < 2; g++) { frag_c[2 * g] = {}; frag_c[2 * g + 1] = {}; }
-
-    for (int kk = k_beg; kk < k_end; kk++)
+    for (int g = 0; g < groups; g++)
     {
-        const uint32_t* tile32 =
-            (const uint32_t*)(g_packed + ((kk * n16) + col_block * 8 + warp) * words16);
+        const int r_base = g * ROWS_PER_PASS;
+        FragC frag_c[2];
+        frag_c[0] = {};
+        frag_c[1] = {};
 
-        half w[8];
-        if constexpr (HALF_K)
+        for (int kk = k_beg; kk < k_end; kk++)
         {
-            dq8_half_rt<BITS>(tile32, lane << 3, cb, w);
-        }
-        else
-        {
-            uint32_t wb[16];
-#pragma unroll
-            for (int j = 0; j < 8; j++)
+            const uint32_t* tile32 =
+                (const uint32_t*)(g_packed + ((kk * n16) + col_block * 8 + warp) * words16);
+
+            half w[8];
+            if constexpr (HALF_K)
             {
-                wb[2 * j] = tile32[wp0[j]];
-                wb[2 * j + 1] = tile32[wp1[j]];
+                dq8_half_rt<BITS>(tile32, lane << 3, cb, w);
             }
-#pragma unroll
-            for (int j = 0; j < 8; j++)
+            else
             {
-                const uint32_t w0 = __funnelshift_r(wb[2 * j + 1], wb[2 * j], ws0[j]) & 0xffffu;
-                w[j] = decode_3inst(w0, cb);
-            }
-        }
-
-        const half z = __float2half(0.0f);
-        FragB fb0, fb1;
-        fb0.elems[0] = __halves2half2(w[0], w[1]);
-        fb0.elems[1] = __halves2half2(w[2], w[3]);
-        fb1.elems[0] = __halves2half2(w[4], w[5]);
-        fb1.elems[1] = __halves2half2(w[6], w[7]);
-
+                uint32_t wb[16];
 #pragma unroll
-        for (int g = 0; g < 2; g++)
-        {
-            const int r_base = g * ROWS_PER_PASS;
-            if (r_base >= m) break;
+                for (int j = 0; j < 8; j++)
+                {
+                    wb[2 * j] = tile32[wp0[j]];
+                    wb[2 * j + 1] = tile32[wp1[j]];
+                }
+#pragma unroll
+                for (int j = 0; j < 8; j++)
+                {
+                    const uint32_t w0 = __funnelshift_r(wb[2 * j + 1], wb[2 * j], ws0[j]) & 0xffffu;
+                    w[j] = decode_3inst(w0, cb);
+                }
+            }
+
+            const half z = __float2half(0.0f);
+            FragB fb0, fb1;
+            fb0.elems[0] = __halves2half2(w[0], w[1]);
+            fb0.elems[1] = __halves2half2(w[2], w[3]);
+            fb1.elems[0] = __halves2half2(w[4], w[5]);
+            fb1.elems[1] = __halves2half2(w[6], w[7]);
+
             const bool gv0 = (m0 + r_base) < m;
             const bool gv8 = (m8 + r_base) < m;
             const half* xa = g_x + (long)(pair_base + r_base + m0) * k + kk * 16;
@@ -382,44 +383,40 @@ __global__ void exl3_grouped_gemm_direct(
             fa.elems[1] = __halves2half2(gv8 ? xb[kp] : z, gv8 ? xb[kp + 1] : z);
             fa.elems[2] = __halves2half2(gv0 ? xa[kp + 8] : z, gv0 ? xa[kp + 9] : z);
             fa.elems[3] = __halves2half2(gv8 ? xb[kp + 8] : z, gv8 ? xb[kp + 9] : z);
-            ptx_mma_m16n8k16(fa, fb0, frag_c[2 * g]);
-            ptx_mma_m16n8k16(fa, fb1, frag_c[2 * g + 1]);
+            ptx_mma_m16n8k16(fa, fb0, frag_c[0]);
+            ptx_mma_m16n8k16(fa, fb1, frag_c[1]);
+        }
+
+        // atomic-add this group's partials
+        const int c0 = (lane & 3) << 1;
+        const int col0 = n_base + warp * 16 + c0;
+        const int col1 = col0 + 8;
+        const int rm0 = r_base + m0;
+        const int rm8 = r_base + m8;
+        if (rm0 < m)
+        {
+            atomicAdd(g_scratch + (long)(pair_base + rm0) * n + col0,     frag_c[0].elems[0]);
+            atomicAdd(g_scratch + (long)(pair_base + rm0) * n + col0 + 1, frag_c[0].elems[1]);
+            atomicAdd(g_scratch + (long)(pair_base + rm0) * n + col1,     frag_c[1].elems[0]);
+            atomicAdd(g_scratch + (long)(pair_base + rm0) * n + col1 + 1, frag_c[1].elems[1]);
+        }
+        if (rm8 < m)
+        {
+            atomicAdd(g_scratch + (long)(pair_base + rm8) * n + col0,     frag_c[0].elems[2]);
+            atomicAdd(g_scratch + (long)(pair_base + rm8) * n + col0 + 1, frag_c[0].elems[3]);
+            atomicAdd(g_scratch + (long)(pair_base + rm8) * n + col1,     frag_c[1].elems[2]);
+            atomicAdd(g_scratch + (long)(pair_base + rm8) * n + col1 + 1, frag_c[1].elems[3]);
         }
     }
 
     // atomic-add the raw fp32 partials into the scratch (fragment layout:
     // lane holds rows m0/m8, cols warp*16 + (lane&3)*2 + {0,1} per n8 half)
-    const int c0 = (lane & 3) << 1;
-    const int col0 = n_base + warp * 16 + c0;
-    const int col1 = col0 + 8;
-#pragma unroll
-    for (int g = 0; g < 2; g++)
-    {
-        const int r0g = g * ROWS_PER_PASS;
-        if (r0g >= m) break;
-        const int rm0 = r0g + m0;
-        const int rm8 = r0g + m8;
-        if (rm0 < m)
-        {
-            atomicAdd(g_scratch + (long)(pair_base + rm0) * n + col0,     frag_c[2 * g].elems[0]);
-            atomicAdd(g_scratch + (long)(pair_base + rm0) * n + col0 + 1, frag_c[2 * g].elems[1]);
-            atomicAdd(g_scratch + (long)(pair_base + rm0) * n + col1,     frag_c[2 * g + 1].elems[0]);
-            atomicAdd(g_scratch + (long)(pair_base + rm0) * n + col1 + 1, frag_c[2 * g + 1].elems[1]);
-        }
-        if (rm8 < m)
-        {
-            atomicAdd(g_scratch + (long)(pair_base + rm8) * n + col0,     frag_c[2 * g].elems[2]);
-            atomicAdd(g_scratch + (long)(pair_base + rm8) * n + col0 + 1, frag_c[2 * g].elems[3]);
-            atomicAdd(g_scratch + (long)(pair_base + rm8) * n + col1,     frag_c[2 * g + 1].elems[2]);
-            atomicAdd(g_scratch + (long)(pair_base + rm8) * n + col1 + 1, frag_c[2 * g + 1].elems[3]);
-        }
-    }
 }
 
 // epilogue: per (row, col_block) warp — Hadamard butterfly over the summed
 // 128-col group, then kRScale/svh/bias into the fp16/bf16 output.
 __global__ void exl3_grouped_epilogue(
-    const float* __restrict__ g_scratch,
+    float* __restrict__ g_scratch,
     const half* const* __restrict__ g_svh_arr,
     const half* const* __restrict__ g_bias_arr,
     const long* __restrict__ g_offsets,
@@ -444,7 +441,11 @@ __global__ void exl3_grouped_epilogue(
 
     float v[4];
     for (int j = 0; j < 4; j++)
-        v[j] = g_scratch[(long)r * n + n_base + lane + 32 * j];
+    {
+        const long sc = (long)r * n + n_base + lane + 32 * j;
+        v[j] = g_scratch[sc];
+        g_scratch[sc] = 0.0f;   // self-cleaning: the next launch sees zeros
+    }
     had_warp_butterfly(v, lane);
     for (int j = 0; j < 4; j++)
     {
