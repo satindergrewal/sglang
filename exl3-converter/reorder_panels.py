@@ -26,8 +26,13 @@ for shard in shards:
     out = {}
     n_panels = 0
     for name, t in tensors.items():
-        if name.endswith(".trellis") and ".mlp.experts." in name:
+        if name.endswith(".trellis"):
+            # ALL trellis panels: MoE experts AND attention/dense projections.
+            # The B-layout addressing in the kernels matches this order.
             k16, n16, wb = t.shape
+            if n16 % 8 != 0:
+                out[name] = t
+                continue
             # (kk, col_block, tile, wb) -> (col_block, kk, tile, wb)
             t2 = t.view(k16, n16 // 8, 8, wb).permute(1, 0, 2, 3).contiguous()
             out[name] = t2.view(k16, n16, wb)
