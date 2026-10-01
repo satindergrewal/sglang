@@ -16,6 +16,12 @@ void sgl_exl3_route_gather(at::Tensor x, at::Tensor order, at::Tensor tok,
                            at::Tensor sids, at::Tensor wts, int64_t num_experts,
                            int64_t topk, double wscale, at::Tensor xp,
                            at::Tensor pw);
+void sgl_exl3_grouped_linear_direct_f(at::Tensor x, at::Tensor packed_ptrs,
+                                      at::Tensor svh_ptrs, at::Tensor bias_ptrs,
+                                      at::Tensor counts, at::Tensor offsets,
+                                      int64_t cb, int64_t bits_in, int64_t half_k_in,
+                                      int64_t splits_in, at::Tensor scratch,
+                                      at::Tensor out);
 void sgl_exl3_grouped_linear_direct_b(at::Tensor x, at::Tensor packed_ptrs,
                                       at::Tensor svh_ptrs, at::Tensor bias_ptrs,
                                       at::Tensor counts, at::Tensor offsets,
@@ -48,6 +54,9 @@ TORCH_LIBRARY(sgl_exl3_grouped, m)
     m.def("grouped_linear_direct(Tensor x, Tensor packed_ptrs, Tensor svh_ptrs, Tensor bias_ptrs, "
           "Tensor counts, Tensor offsets, int cb, int bits, int half_k, int splits, "
           "Tensor scratch, Tensor(a!) out) -> ()");
+    m.def("grouped_linear_direct_f(Tensor x, Tensor packed_ptrs, Tensor svh_ptrs, Tensor bias_ptrs, "
+          "Tensor counts, Tensor offsets, int cb, int bits, int half_k, int splits, "
+          "Tensor scratch, Tensor(a!) out) -> ()");
     m.def("grouped_linear_direct_b(Tensor x, Tensor packed_ptrs, Tensor svh_ptrs, Tensor bias_ptrs, "
           "Tensor counts, Tensor offsets, int cb, int bits, int half_k, int splits, "
           "Tensor scratch, Tensor(a!) out) -> ()");
@@ -61,5 +70,6 @@ TORCH_LIBRARY_IMPL(sgl_exl3_grouped, CUDA, m)
     m.impl("route_gather", torch::kCUDA, &exl3::sgl_exl3_route_gather);
     m.impl("grouped_linear", torch::kCUDA, &exl3::sgl_exl3_grouped_linear);
     m.impl("grouped_linear_direct", torch::kCUDA, &exl3::sgl_exl3_grouped_linear_direct);
+    m.impl("grouped_linear_direct_f", torch::kCUDA, &exl3::sgl_exl3_grouped_linear_direct_f);
     m.impl("grouped_linear_direct_b", torch::kCUDA, &exl3::sgl_exl3_grouped_linear_direct_b);
 }
