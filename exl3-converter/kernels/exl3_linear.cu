@@ -341,8 +341,8 @@ __global__ void exl3_gemm_kernel_v2(
     // block's k-scan is contiguous (reorder_panels.py, EXL3_PANEL_LAYOUT=B).
     const long stride = layout_b ? (long)8 * words16 : (long)n16 * words16;
     const uint32_t* tile_base = (const uint32_t*)(g_packed +
-        (layout_b ? ((long)col_block * k16 + k_beg) * 8 * words16
-                  : ((long)k_beg * n16 + col_block * 8) * words16));
+        (layout_b ? ((long)col_block * k16 + k_beg) * 8 * words16 + warp * words16
+                  : ((long)k_beg * n16 + col_block * 8 + warp) * words16));
     for (int kk = k_beg; kk < k_end; kk++)
     {
         const uint32_t* tile32 = (const uint32_t*)(tile_base + (kk - k_beg) * stride);

@@ -134,8 +134,8 @@ __global__ void exl3_grouped_gemm_kernel_v2(
 
     const long pstride = layout_b ? (long)8 * words16 : (long)n16 * words16;
     const uint32_t* tile_base = (const uint32_t*)(g_packed +
-        (layout_b ? ((long)col_block * k16 + k_beg) * 8 * words16
-                  : ((long)k_beg * n16 + col_block * 8) * words16));
+        (layout_b ? ((long)col_block * k16 + k_beg) * 8 * words16 + warp * words16
+                  : ((long)k_beg * n16 + col_block * 8 + warp) * words16));
     for (int kk = k_beg; kk < k_end; kk++)
     {
         const uint32_t* tile32 =
