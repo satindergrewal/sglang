@@ -1377,7 +1377,8 @@ class ExL3MoEMethod(FusedMoEMethodBase):
                     packed[f"{proj}_cb"], packed[f"{proj}_bits"],
                     int(packed[f"{proj}_half_k"]), splits_v, scratch, out)
                 return out
-            if use_direct and int(packed[f"{proj}_cb"]) == 2 and not int(packed[f"{proj}_half_k"]):
+            if (use_direct and os.environ.get("EXL3_MOE_FUSED_DECODE") == "1"
+                    and int(packed[f"{proj}_cb"]) == 2 and not int(packed[f"{proj}_half_k"])):
                 # Decode-into-fragment direct (mul1 4-bit): the fused
                 # pair-decode fills the mma B-fragment registers directly
                 # (measured 1.22-1.29x vs the Phase-1 kernel at P=32/64).
