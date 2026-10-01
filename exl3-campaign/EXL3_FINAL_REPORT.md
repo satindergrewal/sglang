@@ -61,9 +61,14 @@ see §7).
 ### 3.1 fp8 KV row (MEASURED 2026-10-01, SHM transport, images 28t/u/v)
 | Drafter | native tok/s | EXL3-3.75 tok/s | EXL3/native |
 |---|---|---|---|
-| none | 227.06 | 98.97 | 43.6% |
-| DFlash2 (block 7) | 288.52 | 126.69 | 43.9% |
-| EAGLE 3/1/4 (radix ON) | 171.95 | 81.47 | 47.4% |
+| none | 227.06 | **115.65** (2026-10-02, layout-B) | **51.0%** |
+| DFlash2 (block 7) | 288.52 | 126.69 (2026-10-01 config) | 43.9% |
+| EAGLE 3/1/4 (radix ON) | 171.95 | 81.47 (2026-10-01 config) | 47.4% |
+
+The 2026-10-02 layout-B config (see journal): dense stride-unit fix +
+grouped/direct layout-B kernels + loader-side panel reorder + HeadMethod
+inverse; single-stream TPOT 19.6 ms (was 28.0 ms). DFlash2/EAGLE cells
+pending re-bench on this config.
 
 ### 3.2 nvfp4 KV row (MEASURED 2026-10-01, SHM transport)
 | Drafter | native tok/s | EXL3-3.75 tok/s | EXL3/native |
@@ -250,7 +255,7 @@ budget, before dense/NCCL/misc).
    disabled still hangs" evidence was invalid — `NCCL_P2P=0/DISABLE` are not
    valid NCCL 2.30 knobs and were silently ignored; the SHM path is untested.
    Numbers taken under SHM transport get a transport caveat in §3.
-1. Power-cycle box → `boot_daily375.sh` → verify "Paris" → pool number.
+1. Power-cycle box → `/tmp/boot_lb5.sh` (layout-B daily; boots image 28x with bind-mounted fixed .so + patched runner on the out375 artifact) → chat-templated "hi" + raw probe → pool number.
 2. `boot_eagle28p.sh` → coherence + 111 bench EAGLE radix-ON (EXL3 cell).
    If coherent: re-run native EAGLE radix-ON. If garbage (decode-path
    staleness): add decode-side prefix guard, rebuild, retest.
