@@ -858,6 +858,15 @@ class LogitsProcessor(nn.Module):
         hidden_states, local_hidden_states = self._gather_dp_attn_hidden_states(
             hidden_states, logits_metadata
         )
+        import os as _os
+        if _os.environ.get("SGLANG_DEBUG_LP") and logits_metadata.forward_mode.is_extend():
+            try:
+                torch.save(
+                    {"hidden": hidden_states.detach().float().cpu(), "shape": tuple(hidden_states.shape)},
+                    f"/dump/lp_hidden_{torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}.pt",
+                )
+            except Exception as e:
+                print("lp debug save failed:", e)
         _trace_e2e_logits(
             "dp_hidden_gather_returned",
             global_shape=tuple(hidden_states.shape),

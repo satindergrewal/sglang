@@ -2537,9 +2537,17 @@ def update_sliding_window_buffer(
         mstat = None
         if m is not None:
             mstat = f"mapping size={m.numel()} nonzero={(m > 0).sum().item()}"
-        logger.info(
+        kvmax = ""
+        try:
+            kb = token_to_kv_pool.get_key_buffer(1)  # SWA layer 1 (global id)
+            idx = window_kv_indices[: min(8, window_kv_indices.numel())].long()
+            kvmax = f" kbuf@idx absmax={kb[idx].float().abs().max().item():.4f}"
+        except Exception as e:
+            kvmax = f" kbuf-sample-failed: {e}"
+        import logging as _lg
+        _lg.getLogger(__name__).warning(
             f"[swameta] translated={translated} bs={bs} lens={window_kv_lens[:4].tolist()} "
             f"indptr={window_kv_indptr[:5].tolist()} idx[:8]={window_kv_indices[:8].tolist()} "
-            f"mapping={mstat}"
+            f"mapping={mstat}{kvmax}"
         )
     return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx

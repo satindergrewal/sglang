@@ -83,6 +83,26 @@ def _load_exl3_patch_so() -> None:
 
 _load_exl3_patch_so()
 
+
+_EXL3_GROUPED_SO = "/work/exl3_ops/exl3_ops_patch.so"
+
+
+def _load_exl3_grouped_so() -> None:
+    """Grouped-MoE patch module (dense ops + grouped op). Loaded when
+    EXL3_MOE_GROUPED=1; no-op when absent. The module registers its ops as
+    fragments, so it must load AFTER the primary op source."""
+    if (
+        os.environ.get("EXL3_MOE_GROUPED") == "1"
+        and os.path.exists(_EXL3_GROUPED_SO)
+    ):
+        try:
+            torch.ops.load_library(_EXL3_GROUPED_SO)
+            logger.info("exl3: loaded grouped-MoE ops %s", _EXL3_GROUPED_SO)
+        except Exception as e:
+            logger.warning("exl3: grouped ops load failed: %s", e)
+
+_load_exl3_grouped_so()
+
 _is_cuda = is_cuda()
 
 # ---------------------------------------------------------------------------
@@ -341,6 +361,23 @@ def dequant_matrix_orig(trellis: torch.Tensor, suh: torch.Tensor, svh: torch.Ten
 # ---------------------------------------------------------------------------
 
 _EXL3_PARAMS = ("trellis", "suh", "svh", "mul1", "mcg", "bias")
+
+
+class MoEGroupedOverflow(Exception):
+    """Pair count exceeds the grouped kernel's per-pass capacity."""
+
+_GROUPED_WS_CACHE: dict = {}
+_DIRECT_SCRATCH_CACHE: dict = {}
+
+try:
+    _HAS_HAD_IN_PAIRS = hasattr(torch.ops.sgl_exl3_grouped, "grouped_had_in_pairs")
+except (AttributeError, RuntimeError):
+    _HAS_HAD_IN_PAIRS = False
+
+try:
+    _HAS_FUSED_ROUTE = hasattr(torch.ops.sgl_exl3_grouped, "route_sort")
+except (AttributeError, RuntimeError):
+    _HAS_FUSED_ROUTE = False
 _SHARD_NAME_TO_INDEX = {"q": 0, "k": 1, "v": 2}
 _PARAM_DTYPES = {
     "trellis": torch.int16,
@@ -393,6 +430,9 @@ class ExL3Config(QuantizationConfig):
         self.mtp_bits = mtp_bits
         self.calibration = calibration
         self.tensor_storage = tensor_storage or {}
+        # Preserve undeclared keys (e.g. interm_comp_last_layer) for the model
+        # code to read without depending on the raw config dict.
+        self.extra = dict(extra)
 
     def get_name(self) -> str:
         return "exl3"
@@ -419,6 +459,10 @@ class ExL3Config(QuantizationConfig):
             mtp_bits=config.get("mtp_bits"),
             calibration=config.get("calibration"),
             tensor_storage=config.get("tensor_storage"),
+            **{k: v for k, v in config.items()
+               if k not in ("version", "bpw", "head_bits", "codebook",
+                            "out_scales", "mtp_bits", "calibration",
+                            "tensor_storage", "quant_method")},
         )
 
     def get_scaled_act_names(self) -> List[str]:
@@ -583,6 +627,14 @@ class ExL3LinearMethod(LinearMethodBase):
             in16_pr = layer._exl3_in_pr // 16
             if k16 != in16_pr and k16 == in16_pr * tp:
                 t = t[rank * in16_pr : (rank + 1) * in16_pr, :, :]
+            if os.environ.get("EXL3_PANEL_LAYOUT") == "B":
+                # Reorder to the kernel's (col_block, kk, tile, words) panel
+                # layout AFTER sharding: the permutation groups 8 consecutive
+                # 16-col tiles (128 cols), and every shard is 128-col aligned.
+                t = t.contiguous()
+                k16s, n16s, wbs = t.shape
+                t = (t.view(k16s, n16s // 8, 8, wbs).permute(1, 0, 2, 3)
+                     .contiguous().view(k16s, n16s, wbs).contiguous())
             return t
         return t
 
@@ -744,6 +796,12 @@ class ExL3HeadMethod(ExL3LinearMethod):
             raise RuntimeError("exl3: quantized lm_head must be a single matrix")
         trellis, suh = g[0]["trellis"], g[0]["suh"]
         svh, cb = g[0]["svh"], g[0]["codebook"]
+        if os.environ.get("EXL3_PANEL_LAYOUT") == "B":
+            # The loader reordered panels to the kernel's layout B; the
+            # one-time head materialization dequant assumes A order. Invert.
+            k16s, n16s, wbs = trellis.shape
+            trellis = (trellis.view(n16s // 8, k16s, 8, wbs).permute(1, 0, 2, 3)
+                       .contiguous().view(k16s, n16s, wbs).contiguous())
         # Chunk over the vocab dim: the output-side Hadamard is blockwise per
         # 128 columns, so 128-aligned column chunks are bit-identical while
         # bounding the fp32 intermediates of the preapply chain.
@@ -912,6 +970,14 @@ class ExL3MoEMethod(FusedMoEMethodBase):
                 if not (start <= expert_id < start + num_local):
                     return
                 expert_id = expert_id - start
+            if suffix == "trellis" and os.environ.get("EXL3_PANEL_LAYOUT") == "B":
+                # Whole-expert panels arrive unsharded under EP; reorder to
+                # the kernel's layout-B here (covers the packed pointer arrays
+                # and the overflow python-loop fallback alike).
+                lt = loaded_weight
+                k16s, n16s, wbs = lt.shape
+                loaded_weight = (lt.view(k16s, n16s // 8, 8, wbs).permute(1, 0, 2, 3)
+                                 .contiguous().view(k16s, n16s, wbs).contiguous())
             key = (expert_id, prefix, shard_id, suffix)
             layer._exl3_moe_records.setdefault(key, []).append(loaded_weight)
 
@@ -999,6 +1065,7 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             # Free this expert's stashed pieces (packed CPU/GPU refs).
             for k in [k for k in recs if k[0] == e]:
                 del recs[k]
+
         layer._exl3_moe_records = {}
         layer.w13_weight = Parameter(w13, requires_grad=False)
         layer.w2_weight = Parameter(w2, requires_grad=False)
@@ -1084,6 +1151,61 @@ class ExL3MoEMethod(FusedMoEMethodBase):
                 del recs[k]
         layer._exl3_moe_records = {}
         layer._exl3_moe_packed = packed
+        # Grouped-kernel launch metadata: per-expert device pointer arrays per
+        # projection; sentinel expert E slot holds null pointers (counts[E]=0).
+        def _ptr_arrays(proj):
+            n_exp = len(packed[proj])
+            pk = torch.zeros(n_exp + 1, dtype=torch.int64, device=dev)
+            sv = torch.zeros(n_exp + 1, dtype=torch.int64, device=dev)
+            bi = torch.zeros(n_exp + 1, dtype=torch.int64, device=dev)
+            bits = 4
+            half_k = 0
+            cb = 2
+            n_out = 0
+            keep = []
+            for i, mat in enumerate(packed[proj]):
+                if mat[0] != "trellis":
+                    raise MoEGroupedOverflow("plain expert in packed state")
+                t, s_, v_, b_, c_ = mat[1], mat[2], mat[3], mat[4], mat[5]
+                pk[i] = t.data_ptr()
+                sv[i] = v_.data_ptr()
+                bi[i] = b_.data_ptr() if b_ is not None else 0
+                wb = t.shape[2]
+                bits = wb // 16
+                half_k = 1 if wb % 16 else 0
+                cb = int(c_)
+                n_out = v_.shape[0]
+                keep.append((t, v_, b_))
+            pk[n_exp] = 0
+            sv[n_exp] = 0
+            bi[n_exp] = 0
+            keep_alive.extend(keep)
+            # suh device pointers (input-side Hadamard scales) for the
+            # grouped had_in kernel — one per expert, sentinel = null.
+            su = torch.zeros(n_exp + 1, dtype=torch.int64, device=dev)
+            for i, mat in enumerate(packed[proj]):
+                su[i] = mat[2].data_ptr()
+            return {"ptrs": pk, "svh_ptrs": sv, "bias_ptrs": bi,
+                    "svh_dev_ptrs": su,
+                    "bits": bits, "half_k": half_k, "cb": cb, "n_out": n_out}
+
+        keep_alive = []
+        for proj in ("gate", "up", "down"):
+            meta = _ptr_arrays(proj)
+            packed[f"{proj}_ptrs"] = meta["ptrs"]
+            packed[f"{proj}_svh_ptrs"] = meta["svh_ptrs"]
+            packed[f"{proj}_bias_ptrs"] = meta["bias_ptrs"]
+            packed[f"{proj}_bits"] = meta["bits"]
+            packed[f"{proj}_half_k"] = meta["half_k"]
+            packed[f"{proj}_cb"] = meta["cb"]
+            packed[f"{proj}_suh_keep"] = [m[2] for m in packed[proj]]
+            packed[f"{proj}_suh_ptrs_dev"] = meta["svh_dev_ptrs"]
+            if proj == "down":
+                packed["down_n"] = meta["n_out"]
+            else:
+                packed["gate_n"] = meta["n_out"]
+        self._exl3_keep_alive = keep_alive
+        self._probe_layer = getattr(layer, 'layer_id', None)
         self._packed_state = packed
         self._packed_gated = gated
         torch.cuda.empty_cache()
@@ -1106,6 +1228,302 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         torch.ops.sgl_kernel.sgl_exl3_linear(xh, trellis, svh, bias, cb, out)
         return out
 
+    def _direct_scratch(self, dev, n):
+        """Cached (64, n) fp32 atomic-accumulation scratch for the direct
+        decode path. Zeroed by the caller per launch. NEVER allocated during
+        graph capture — a capture-time allocation is owned by that graph's
+        memory pool and must not be reused elsewhere."""
+        key = (str(dev), n)
+        # during capture: FRESH uncached scratch — the graph's memory pool
+        # owns it, so there is no cross-graph aliasing
+        if torch.cuda.is_current_stream_capturing():
+            return torch.zeros(64, n, dtype=torch.float32, device=dev)
+        buf = _DIRECT_SCRATCH_CACHE.get(key)
+        if buf is None:
+            buf = torch.zeros(64, n, dtype=torch.float32, device=dev)
+            _DIRECT_SCRATCH_CACHE[key] = buf
+        return buf
+
+    def _grouped_ws_make(self, E, packed, splits=4, rows=16, chunks=4):
+        """Persistent grouped-kernel workspaces keyed by (projection,
+        col_blocks). rows = ws slab rows (16 full / 4 decode variant);
+        chunks = pair-chunks per expert (rows*chunks = per-expert pair
+        capacity the overflow check enforces). Zeros are restored in-kernel
+        after each launch, so reuse is graph-safe. E_op = the packed pointer
+        array length (global experts + sentinel) — the op derives E from it
+        and checks the ws dims against it."""
+        gate_n = packed["gate_n"]
+        down_n = packed["down_n"]
+        dev = packed["gate_ptrs"].device
+        E_op = int(packed["gate_ptrs"].size(0))
+        CH = chunks
+        ws_by = {}
+        cnt_by = {}
+        for proj, n_out in (("gate", gate_n), ("up", gate_n), ("down", down_n)):
+            cb_n = int(n_out // 128)
+            ws_by[(proj, cb_n)] = torch.zeros(
+                (cb_n, splits, E_op * CH, rows, 128),
+                dtype=torch.float32, device=dev)
+            cnt_by[(proj, cb_n)] = torch.zeros(
+                (E_op * cb_n, CH), dtype=torch.int32, device=dev)
+        return (E_op, ws_by, cnt_by)
+
+    def _run_packed_moe_grouped(self, x, ids, wts, packed, out_dt,
+                                runner_config, E):
+        """Graph-capturable packed MoE: one grouped trellis launch per
+        projection. Raises MoEGroupedOverflow when an expert's pair count
+        exceeds the kernel's per-pass capacity; the caller falls back to the
+        python-loop path (correct, slower)."""
+        K = ids.shape[-1]
+        P = ids.numel()
+        comp = getattr(self, "_interm_comp", 1.0) or 1.0
+        rsf = runner_config.routed_scaling_factor
+        wscale = comp * (rsf if rsf is not None else 1.0)
+        dev = x.device
+        # Variant selection (measured): eager decode (P<=64) takes the
+        # direct atomic-split kernel (rows=4 ws / chunks=8 / splits=16 when
+        # the ws fallback path is chosen); captured graphs and prefill keep
+        # the rows=16 worst-case layout.
+        # The direct kernel is capture-safe (dynamic group loop, no host
+        # syncs, self-cleaning scratch); the P<=64 bound limits it to decode
+        # shapes where it wins — larger P stays on the v2 split path.
+        panel_b = os.environ.get("EXL3_PANEL_LAYOUT") == "B"
+        use_direct = (P <= 64 and panel_b
+                      and os.environ.get("EXL3_MOE_NO_DIRECT") != "1")
+        if use_direct:
+            rows, chunks, splits_v = 4, 8, 16
+        else:
+            rows, chunks, splits_v = 16, 4, 4
+
+
+        if _HAS_FUSED_ROUTE and P <= 512 and os.environ.get("EXL3_MOE_NO_FUSED_ROUTE") != "1":
+            # Two-launch fused routing (single-block bitonic sort + gather
+            # grid). Replaces ~10 tiny torch kernels (~80us of launch
+            # overhead at decode sizes) with ~12us. The fused sort is not
+            # stable, which is fine: pair rows within an expert segment may
+            # permute freely — tok/pw follow the same permutation.
+            sids = torch.empty(P, dtype=torch.int32, device=dev)
+            order = torch.empty(P, dtype=torch.int32, device=dev)
+            tok = torch.empty(P, dtype=torch.int32, device=dev)
+            counts = torch.zeros(E + 1, dtype=torch.int32, device=dev)
+            offsets = torch.zeros(E + 2, dtype=torch.int64, device=dev)
+            torch.ops.sgl_exl3_grouped.route_sort(
+                ids.reshape(-1).to(torch.int32).contiguous(),
+                E, K, sids, order, tok, counts, offsets)
+            x_pairs = torch.empty(P, x.shape[1], dtype=x.dtype, device=dev)
+            pw = torch.empty(P, dtype=torch.float32, device=dev)
+            torch.ops.sgl_exl3_grouped.route_gather(
+                x, order, tok, sids,
+                wts.reshape(-1).to(torch.float32).contiguous(),
+                E, K, wscale, x_pairs, pw)
+            if (not use_direct and not torch.cuda.is_current_stream_capturing()
+                    and int(counts[:-1].max().item()) > rows * chunks):
+                raise MoEGroupedOverflow()
+            CH = 4
+        else:
+            flat = ids.reshape(-1).to(torch.long)
+            key = torch.where(flat >= 0, flat, torch.full_like(flat, E))
+            order = torch.argsort(key, stable=True)
+            sids = key[order]
+            tok = order // K
+            pw = wts.reshape(-1)[order].float()
+            if comp != 1.0:
+                pw = pw * comp
+            if rsf is not None:
+                pw = pw * rsf
+            counts = torch.histc(sids.float(), bins=E, min=0, max=E - 1).to(torch.int32)
+            # Sentinel slot appended as a device-side zero (no H2D scalar copy —
+            # `counts[E] = 0` would be an index_put with a CPU scalar, which is
+            # illegal inside CUDA graph capture).
+            counts = torch.cat(
+                [counts, torch.zeros(1, dtype=torch.int32, device=counts.device)]
+            )
+            offsets = torch.zeros(E + 2, dtype=torch.int64, device=x.device)
+            offsets[1:] = counts.cumsum(0).to(torch.int64)
+            x_pairs = x[tok].contiguous()
+            # Fully device-side: no D2H syncs in this path (CUDA-graph-safe).
+            # The sentinel count is zeroed on the GPU tensor the kernel reads.
+            # The sentinel slot E (remote pairs) has NULL pointer entries in the
+            # arrays — zero its count so the kernel never dereferences slot E,
+            # and zero the remote pairs' weights so their (unprocessed) output
+            # rows contribute nothing at the combine. The mask must follow the
+            # SORTED order (pw is wts[order]); sids == key[order].
+            pw = torch.where(sids < E, pw, torch.zeros_like(pw))
+            if (not use_direct and not torch.cuda.is_current_stream_capturing()
+                    and int(counts[:-1].max().item()) > rows * chunks):
+                raise MoEGroupedOverflow()
+
+            CH = 4
+        # Persistent per-layer workspace/counters (fixed shapes): avoids
+        # several GB of alloc/free per pass; zeros are restored in-kernel.
+        # ONE shared workspace set per (E, gate_n, down_n, splits, device)
+        # across all MoE layers: the shapes are layer-identical. Per-layer
+        # persistence (47 x ~200 MB) OOMs the KV pool, while per-step
+        # allocation re-fills ~200 MB of zeros every layer every step (~50%
+        # of the decode step in GPU kernel time). The kernels restore the
+        # workspace zeros in-place after each launch, so sharing/reuse is
+        # graph-safe.
+        # Variant selection (measured): at decode P (<=64 pairs) the launch
+        # is latency-bound at low active-block counts; the rows=4 ws slab
+        # (only m<=4 rows are real at decode) quarters the split-reduction
+        # traffic, making splits=16 profitable (kernels restore zeros
+        # in-place). Eager-only: the overflow check needs a host sync, and
+        # captured graphs must keep the rows=16 worst-case layout.
+        # ONE shared workspace set per (E, gate_n, down_n, splits, rows,
+        # chunks, device) across all MoE layers: the shapes are
+        # layer-identical. Per-layer persistence (47 x ~200 MB) OOMs the KV
+        # pool, while per-step allocation re-fills ~200 MB of zeros every
+        # layer every step (~50% of the decode step in GPU kernel time).
+        if use_direct:
+            # the direct path carries its own scratch — no workspace
+            ws_by = cnt_by = None
+        else:
+            E_op = int(packed["gate_ptrs"].size(0))
+            key = (E_op, packed["gate_n"], packed["down_n"], splits_v, rows, chunks,
+                   packed["gate_ptrs"].device.index)
+            ws_cache = _GROUPED_WS_CACHE.get(key)
+            if ws_cache is None:
+                ws_cache = self._grouped_ws_make(E, packed, splits_v, rows, chunks)
+                _GROUPED_WS_CACHE[key] = ws_cache
+            _, ws_by, cnt_by = ws_cache
+
+        def grouped_gemm(xp, proj, n_out, splits, zero_init=False):
+            if use_direct and panel_b:
+                # Layout-B direct: the contiguous-panel kernel
+                scratch = self._direct_scratch(dev, n_out)
+                scratch.zero_()
+                out = torch.zeros((xp.shape[0], n_out), dtype=out_dt, device=dev)
+                torch.ops.sgl_exl3_grouped.grouped_linear_direct_b(
+                    xp, packed[f"{proj}_ptrs"], packed[f"{proj}_svh_ptrs"],
+                    packed[f"{proj}_bias_ptrs"], counts, offsets,
+                    packed[f"{proj}_cb"], packed[f"{proj}_bits"],
+                    int(packed[f"{proj}_half_k"]), splits_v, scratch, out)
+                return out
+            if (use_direct and os.environ.get("EXL3_MOE_FUSED_DECODE") == "1"
+                    and int(packed[f"{proj}_cb"]) == 2 and not int(packed[f"{proj}_half_k"])):
+                # Decode-into-fragment direct (mul1 4-bit): the fused
+                # pair-decode fills the mma B-fragment registers directly
+                # (measured 1.22-1.29x vs the Phase-1 kernel at P=32/64).
+                scratch = self._direct_scratch(dev, n_out)
+                scratch.zero_()
+                out = torch.zeros((xp.shape[0], n_out), dtype=out_dt, device=dev)
+                torch.ops.sgl_exl3_grouped.grouped_linear_direct_f(
+                    xp, packed[f"{proj}_ptrs"], packed[f"{proj}_svh_ptrs"],
+                    packed[f"{proj}_bias_ptrs"], counts, offsets,
+                    packed[f"{proj}_cb"], packed[f"{proj}_bits"],
+                    int(packed[f"{proj}_half_k"]), splits_v, scratch, out)
+                return out
+            if use_direct:
+                # Direct decode path: atomic-split partials into a zeroed
+                # fp32 scratch + fused epilogue; no workspace round-trip.
+                # Capacity 32 pairs/expert (G=2) — gated by the overflow
+                # checks above; zero_init is inherent (scratch.zero_()).
+                scratch = self._direct_scratch(dev, n_out)
+                scratch.zero_()
+                # ZERO-init (not empty): rows owned by the routing sentinel
+                # (remote pairs, pw=0) are never written by the epilogue, and
+                # the combine's 0 x uninitialized-memory can be NaN.
+                out = torch.zeros((xp.shape[0], n_out), dtype=out_dt, device=dev)
+                torch.ops.sgl_exl3_grouped.grouped_linear_direct(
+                    xp, packed[f"{proj}_ptrs"], packed[f"{proj}_svh_ptrs"],
+                    packed[f"{proj}_bias_ptrs"], counts, offsets,
+                    packed[f"{proj}_cb"], packed[f"{proj}_bits"],
+                    int(packed[f"{proj}_half_k"]), splits_v, scratch, out)
+                return out
+            cb_n = int(n_out // 128)
+            ws = ws_by[(proj, cb_n)]
+            cnt = cnt_by[(proj, cb_n)]
+            out = (torch.zeros((xp.shape[0], n_out), dtype=out_dt, device=dev)
+                   if zero_init
+                   else torch.empty((xp.shape[0], n_out), dtype=out_dt,
+                                    device=dev))
+            torch.ops.sgl_exl3_grouped.grouped_linear(
+                xp, packed[f"{proj}_ptrs"], packed[f"{proj}_svh_ptrs"],
+                packed[f"{proj}_bias_ptrs"], counts, offsets,
+                ws, cnt, packed[f"{proj}_cb"], splits, CH,
+                packed[f"{proj}_bits"], packed[f"{proj}_half_k"], out)
+            return out
+
+        # Per-expert input Hadamard: ONE kernel launch per projection, reading
+        # counts/offsets/suh-pointers on device (CUDA-graph-safe: fixed grid,
+        # data-dependence resolved at replay). Rows the kernel does not
+        # transform (zero-count experts, overflow, sentinel) are zeroed.
+        xh_gate = torch.empty_like(x_pairs)
+        xh_up = torch.empty_like(x_pairs)
+        # Pair-indexed transform when the kernel offers it: one small grid
+        # (P x k/1024) instead of (rows_cap x E x k/1024) mostly-empty blocks.
+        if _HAS_HAD_IN_PAIRS:
+            sids_i32 = sids.to(torch.int32)
+            torch.ops.sgl_exl3_grouped.grouped_had_in_pairs(
+                x_pairs, sids_i32, packed["gate_suh_ptrs_dev"], xh_gate)
+            torch.ops.sgl_exl3_grouped.grouped_had_in_pairs(
+                x_pairs, sids_i32, packed["up_suh_ptrs_dev"], xh_up)
+        else:
+            torch.ops.sgl_exl3_grouped.grouped_had_in(
+                x_pairs, packed["gate_suh_ptrs_dev"], counts, offsets, 64, xh_gate)
+            torch.ops.sgl_exl3_grouped.grouped_had_in(
+                x_pairs, packed["up_suh_ptrs_dev"], counts, offsets, 64, xh_up)
+
+        import os as _os
+        _probe = (
+            _os.environ.get("EXL3_MOE_PROBE") == "1"
+            and getattr(self, "_probe_layer", None) == int(os.environ.get("EXL3_MOE_PROBE_LAYER", "1"))
+            and not getattr(self, "_probe_done", False)
+        )
+        act = runner_config.activation
+        o_g = grouped_gemm(xh_gate, "gate", packed["gate_n"], splits_v)
+        o_u = grouped_gemm(xh_up, "up", packed["gate_n"], splits_v)
+        if act == "silu":
+            mid = (F.silu(o_g.float()) * o_u.float()).to(out_dt)
+        elif act == "gelu":
+            mid = (F.gelu(o_g.float()) * o_u.float()).to(out_dt)
+        else:
+            raise NotImplementedError(f"exl3 grouped: activation {act}")
+        # Down projection consumes mid in the Hadamard domain per expert —
+        # same single-launch grouped transform (down owns its suh).
+        mid_t = torch.empty_like(mid)
+        if _HAS_HAD_IN_PAIRS:
+            torch.ops.sgl_exl3_grouped.grouped_had_in_pairs(
+                mid, sids_i32, packed["down_suh_ptrs_dev"], mid_t)
+        else:
+            torch.ops.sgl_exl3_grouped.grouped_had_in(
+                mid, packed["down_suh_ptrs_dev"], counts, offsets, 64, mid_t)
+        mid = mid_t        # Down projection: pair rows reach the combine. Output pre-zeroed so
+        # rows the kernel did not process (zero-count experts, overflow,
+        # sentinel) contribute nothing — no CPU-side staging needed.
+        o_d = grouped_gemm(mid, "down", packed["down_n"], splits_v, zero_init=True)
+        out = torch.zeros((x.shape[0], packed["down_n"]),
+                          dtype=torch.float32, device=dev)
+        out.index_add_(0, tok, o_d.float() * pw[:, None].to(out.dtype))
+        if _probe and not torch.cuda.is_current_stream_capturing():
+            # Full-pipeline probe: the runner output vs the per-expert dequant
+            # reference on the SAME raw input/routing (the offline-gate
+            # construction, inside the serve).
+            ref = torch.zeros((x.shape[0], packed["down_n"]),
+                              dtype=torch.float32, device=dev)
+            counts_l = counts.tolist()
+            offsets_l = offsets.tolist()
+            for i in range(E):
+                s0 = int(offsets_l[i]); c = int(counts_l[i])
+                if c <= 0: continue
+                ge = packed["gate"][i]; ue = packed["up"][i]; de = packed["down"][i]
+                rows = tok[s0:s0+c]
+                xe = x[rows]
+                ge_d = dequant_matrix_orig(ge[1], ge[2], ge[3], "mul1").float()
+                ue_d = dequant_matrix_orig(ue[1], ue[2], ue[3], "mul1").float()
+                de_d = dequant_matrix_orig(de[1], de[2], de[3], "mul1").float()
+                m_r = (F.silu(xe.float() @ ge_d) * (xe.float() @ ue_d)) @ de_d
+                ref.index_add_(0, rows, m_r * pw[s0:s0+c].float()[:, None])
+            cos = torch.nn.functional.cosine_similarity(
+                out.float().flatten(), ref.flatten(), dim=0).item()
+            print(f"MOEPROBE full-pipeline cos {cos:.6f} "
+                  f"out_abs {out.abs().max().item():.4f} "
+                  f"ref_abs {ref.abs().max().item():.4f} "
+                  f"pairs {x_pairs.shape[0]} bs {x.shape[0]}", flush=True)
+            self._probe_done = True
+
+        return out
+
     def run_packed_moe(self, dispatch_output, runner_config):
         from sglang.srt.layers.moe.token_dispatcher.standard import (
             StandardCombineInput,
@@ -1120,6 +1538,16 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             raise NotImplementedError(
                 "exl3 MoE packed: apply_router_weight_on_input is not supported"
             )
+        if os.environ.get("EXL3_MOE_GROUPED") == "1":
+            try:
+                # The grouped trellis GEMM is fp16-native; run the expert
+                # chain in fp16 exactly like the loop path and cast back.
+                out = self._run_packed_moe_grouped(
+                    hs.reshape(-1, hs.shape[-1]).to(torch.float16), ids, wts,
+                    packed, torch.float16, runner_config, len(packed["down"]))
+                return StandardCombineInput(hidden_states=out.to(hs.dtype))
+            except MoEGroupedOverflow:
+                pass  # fall through to the python-loop path
         x = hs.reshape(-1, hs.shape[-1])
         # The expert chain runs in fp16, matching the reference EXL3 runtime's
         # numerics contract. This model's MoE down-projections are

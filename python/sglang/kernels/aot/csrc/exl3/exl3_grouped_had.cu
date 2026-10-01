@@ -128,7 +128,7 @@ __global__ void exl3_grouped_had_in_pairs_kernel(
     const int chunk = blockIdx.y * 8 + (threadIdx.x >> 5);  // 8 warps/block
     const int lane = threadIdx.x & 31;
     if (chunk * 128 >= k) return;
-    if (e >= num_experts) return;  // sentinel rows: never read downstream
+    if (e < 0 || e >= num_experts) return;  // invalid/sentinel rows: never read
 
     const int base = chunk * 128;
     const half* g_suh = g_suh_arr[e];

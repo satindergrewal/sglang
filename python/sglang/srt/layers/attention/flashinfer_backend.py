@@ -358,6 +358,8 @@ class FlashInferAttnBackend(AttentionBackend):
         )
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
+        self.dq_full_paged_kernel_lens = None
+        self.dq_swa_page_table = None
         self.cpu_req_pool_indices = None
         # FP4 fake-quant prefill/decode exposes an FP8 workspace to FlashInfer.
         self.flashinfer_kv_cache_dtype = (

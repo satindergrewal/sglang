@@ -60,7 +60,7 @@ __device__ inline void ptx_mma_m16n8k16(const FragA& a, const FragB& b, FragC& c
     );
 }
 
-template <int BITS, bool HALF_K = false>
+template <int BITS, bool HALF_K = false, int WS_ROWS = 16>
 __global__ void exl3_grouped_gemm_kernel_v2(
     const half* __restrict__ g_x,                    // (P, k) pair rows
     const uint16_t* const* __restrict__ g_packed_arr,  // [E]
@@ -73,7 +73,7 @@ __global__ void exl3_grouped_gemm_kernel_v2(
     int chunks_cap,
     int k, int n, int n16, int cb, int splits,
     half* __restrict__ g_out,        // (P, n)
-    int bf16_out)
+    int bf16_out, int layout_b)
 {
     constexpr int words16 = BITS * 16 + (HALF_K ? 8 : 0);
     const int t = threadIdx.x;
@@ -86,10 +86,10 @@ __global__ void exl3_grouped_gemm_kernel_v2(
     const int chunk = flat_z % chunks_cap;
 
     const int cnt = g_counts[e];
-    const int r0 = chunk * ROWS_PER_PASS;
+    const int r0 = chunk * WS_ROWS;
     int m = cnt - r0;
     if (m <= 0) return;
-    if (m > ROWS_PER_PASS) m = ROWS_PER_PASS;
+    if (m > WS_ROWS) m = WS_ROWS;
 
     const int k16 = k >> 4;
     const int k_beg = (int)((long)k16 * ks / splits);
@@ -135,7 +135,8 @@ __global__ void exl3_grouped_gemm_kernel_v2(
     for (int kk = k_beg; kk < k_end; kk++)
     {
         const uint32_t* tile32 =
-            (const uint32_t*)(g_packed + ((kk * n16) + col_block * 8 + warp) * words16);
+            (const uint32_t*)(g_packed + (layout_b ? ((long)col_block * k16 + kk) * 8 * words16 + warp * words16
+                                                    : ((long)kk * n16 + col_block * 8 + warp) * words16));
 
         half w[8];
         if constexpr (HALF_K)
@@ -182,8 +183,8 @@ __global__ void exl3_grouped_gemm_kernel_v2(
     const int c0 = (lane & 3) << 1;
     const long echunk = (long)e * chunks_cap + chunk;
     const long ws_plane = ((long)col_block * splits + ks) * (long)gridDim.z + echunk;
-    float* ws_row0 = g_ws + (ws_plane * ROWS_PER_PASS + m0) * 128;
-    float* ws_row8 = g_ws + (ws_plane * ROWS_PER_PASS + m8) * 128;
+    float* ws_row0 = g_ws + (ws_plane * WS_ROWS + m0) * 128;
+    float* ws_row8 = g_ws + (ws_plane * WS_ROWS + m8) * 128;
     if (v0)
     {
         ws_row0[warp * 16 + c0]         = frag_c[0].elems[0];
@@ -228,7 +229,7 @@ __global__ void exl3_grouped_gemm_kernel_v2(
             for (int s2 = 0; s2 < splits; s2++)
             {
                 const long plane2 = ((long)col_block * splits + s2) * (long)gridDim.z + echunk;
-                acc += g_ws[(plane2 * ROWS_PER_PASS + r) * 128 + cl];
+                acc += g_ws[(plane2 * WS_ROWS + r) * 128 + cl];
             }
             v[j] = acc;
         }
@@ -265,9 +266,216 @@ __global__ void exl3_grouped_gemm_kernel_v2(
         g_cnt[((long)e * gridDim.x + col_block) * chunks_cap + chunk] = 0;  // replay reset
 }
 
-}  // namespace exl3
 
-namespace exl3 {
+// --- v3-direct: decode-path grouped GEMM, atomic-split, no global ws ---
+// Grid (col_blocks, E, splits); block = one expert's pairs for one 128-col
+// block over k-range [k16*ks/splits, k16*(ks+1)/splits). Requires
+// max(counts) <= 16. Accumulates in-register, then atomically adds the raw
+// fp32 partials into a ZEROED (P, n) scratch — the caller runs the
+// butterfly/svh/bias epilogue once afterwards over the summed scratch.
+// Traffic per launch: weight panels + m*128 fp32 atomic adds per block —
+// no workspace round-trip.
+template <int BITS, bool HALF_K = false>
+__global__ void exl3_grouped_gemm_direct(
+    const half* __restrict__ g_x,
+    const uint16_t* const* __restrict__ g_packed_arr,
+    const int* __restrict__ g_counts,
+    const long* __restrict__ g_offsets,
+    int splits, int k, int n, int n16, int cb, int layout_b,
+    float* __restrict__ g_scratch)
+{
+    constexpr int words16 = BITS * 16 + (HALF_K ? 8 : 0);
+    const int t = threadIdx.x;
+    const int lane = t & 31;
+    const int warp = t >> 5;
+    const int col_block = blockIdx.x;
+    const int e = blockIdx.y;
+    const int ks = blockIdx.z;
+
+    const int cnt = g_counts[e];
+    if (cnt <= 0) return;
+    // The last grid-y slot is the routing sentinel (remote pairs, NULL
+    // panels): never dereference it.
+    if (e == gridDim.y - 1) return;
+    // Dynamic pair-groups (graph-safe: the trip count reads device memory at
+    // replay). Groups OUTER, k INNER: each group re-reads its panel slice,
+    // which L2 serves after the first group — the decode chain runs once per
+    // group with full register reuse, no fixed capacity, no host overflow
+    // checks.
+    int m = cnt;
+    const int groups = (m + ROWS_PER_PASS - 1) / ROWS_PER_PASS;
+    const int k16 = k >> 4;
+    const int k_beg = (int)((long)k16 * ks / splits);
+    const int k_end = (int)((long)k16 * (ks + 1) / splits);
+    if (k_beg >= k_end) return;
+    const int n_base = col_block * 128;
+
+    const uint16_t* g_packed = g_packed_arr[e];
+    const long pair_base = g_offsets[e];
+    const int m0 = lane >> 2;
+    const int m8 = m0 + 8;
+    const int kp = (lane & 3) << 1;
+
+    constexpr int n_words = BITS * 256 / 32;
+    int wp0[8], wp1[8], ws0[8];
+    if constexpr (!HALF_K)
+    {
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+        {
+            const int e32 = lane * 8 + j;
+            const int b0 = e32 * BITS + BITS - 16 + 256 * BITS;
+            const int b1 = b0 + 16;
+            const int i0 = b0 / 32;
+            const int i1 = (b1 - 1) / 32;
+            wp0[j] = i0 % n_words;
+            wp1[j] = i1 % n_words;
+            ws0[j] = (i1 + 1) * 32 - b1;
+        }
+    }
+
+    for (int g = 0; g < groups; g++)
+    {
+        const int r_base = g * ROWS_PER_PASS;
+        FragC frag_c[2];
+        frag_c[0] = {};
+        frag_c[1] = {};
+
+        for (int kk = k_beg; kk < k_end; kk++)
+        {
+            const uint32_t* tile32 =
+                (const uint32_t*)(g_packed + (layout_b ? ((long)col_block * k16 + kk) * 8 * words16 + warp * words16
+                                                        : ((long)kk * n16 + col_block * 8 + warp) * words16));
+
+            half w[8];
+            if constexpr (HALF_K)
+            {
+                dq8_half_rt<BITS>(tile32, lane << 3, cb, w);
+            }
+            else
+            {
+                uint32_t wb[16];
+#pragma unroll
+                for (int j = 0; j < 8; j++)
+                {
+                    wb[2 * j] = tile32[wp0[j]];
+                    wb[2 * j + 1] = tile32[wp1[j]];
+                }
+#pragma unroll
+                for (int j = 0; j < 8; j++)
+                {
+                    const uint32_t w0 = __funnelshift_r(wb[2 * j + 1], wb[2 * j], ws0[j]) & 0xffffu;
+                    w[j] = decode_3inst(w0, cb);
+                }
+            }
+
+            const half z = __float2half(0.0f);
+            FragB fb0, fb1;
+            fb0.elems[0] = __halves2half2(w[0], w[1]);
+            fb0.elems[1] = __halves2half2(w[2], w[3]);
+            fb1.elems[0] = __halves2half2(w[4], w[5]);
+            fb1.elems[1] = __halves2half2(w[6], w[7]);
+
+            const bool gv0 = (m0 + r_base) < m;
+            const bool gv8 = (m8 + r_base) < m;
+            const half* xa = g_x + (long)(pair_base + r_base + m0) * k + kk * 16;
+            const half* xb = g_x + (long)(pair_base + r_base + m8) * k + kk * 16;
+            FragA fa;
+            fa.elems[0] = __halves2half2(gv0 ? xa[kp] : z, gv0 ? xa[kp + 1] : z);
+            fa.elems[1] = __halves2half2(gv8 ? xb[kp] : z, gv8 ? xb[kp + 1] : z);
+            fa.elems[2] = __halves2half2(gv0 ? xa[kp + 8] : z, gv0 ? xa[kp + 9] : z);
+            fa.elems[3] = __halves2half2(gv8 ? xb[kp + 8] : z, gv8 ? xb[kp + 9] : z);
+            ptx_mma_m16n8k16(fa, fb0, frag_c[0]);
+            ptx_mma_m16n8k16(fa, fb1, frag_c[1]);
+        }
+
+        // atomic-add this group's partials
+        const int c0 = (lane & 3) << 1;
+        const int col0 = n_base + warp * 16 + c0;
+        const int col1 = col0 + 8;
+        const int rm0 = r_base + m0;
+        const int rm8 = r_base + m8;
+        if (rm0 < m)
+        {
+            atomicAdd(g_scratch + (long)(pair_base + rm0) * n + col0,     frag_c[0].elems[0]);
+            atomicAdd(g_scratch + (long)(pair_base + rm0) * n + col0 + 1, frag_c[0].elems[1]);
+            atomicAdd(g_scratch + (long)(pair_base + rm0) * n + col1,     frag_c[1].elems[0]);
+            atomicAdd(g_scratch + (long)(pair_base + rm0) * n + col1 + 1, frag_c[1].elems[1]);
+        }
+        if (rm8 < m)
+        {
+            atomicAdd(g_scratch + (long)(pair_base + rm8) * n + col0,     frag_c[0].elems[2]);
+            atomicAdd(g_scratch + (long)(pair_base + rm8) * n + col0 + 1, frag_c[0].elems[3]);
+            atomicAdd(g_scratch + (long)(pair_base + rm8) * n + col1,     frag_c[1].elems[2]);
+            atomicAdd(g_scratch + (long)(pair_base + rm8) * n + col1 + 1, frag_c[1].elems[3]);
+        }
+    }
+
+    // atomic-add the raw fp32 partials into the scratch (fragment layout:
+    // lane holds rows m0/m8, cols warp*16 + (lane&3)*2 + {0,1} per n8 half)
+}
+
+// epilogue: per (row, col_block) warp — Hadamard butterfly over the summed
+// 128-col group, then kRScale/svh/bias into the fp16/bf16 output.
+__global__ void exl3_grouped_epilogue(
+    float* __restrict__ g_scratch,
+    const half* const* __restrict__ g_svh_arr,
+    const half* const* __restrict__ g_bias_arr,
+    const long* __restrict__ g_offsets,
+    const int* __restrict__ g_counts,
+    int E, int n,
+    half* __restrict__ g_out,
+    int bf16_out)
+{
+    const int r = blockIdx.x;      // pair row
+    const int col_block = blockIdx.y;
+    const int lane = threadIdx.x;
+    const int n_base = col_block * 128;
+
+    // row -> expert (linear scan; E <= 128, once per warp)
+    int e = -1;
+    for (int i = 0; i < E; i++)
+        if ((long)r >= g_offsets[i] && (long)r < g_offsets[i] + g_counts[i]) { e = i; break; }
+    if (e < 0) return;
+    const half* g_svh = g_svh_arr[e];
+    const half* g_bias = g_bias_arr[e];
+    const long out_row = r;
+
+    float v[4];
+    for (int j = 0; j < 4; j++)
+    {
+        const long sc = (long)r * n + n_base + lane + 32 * j;
+        v[j] = g_scratch[sc];
+        g_scratch[sc] = 0.0f;   // self-cleaning: the next launch sees zeros
+    }
+    had_warp_butterfly(v, lane);
+    for (int j = 0; j < 4; j++)
+    {
+        const int col = n_base + lane + 32 * j;
+        float fv = v[j] * kRScaleG;
+        if (bf16_out)
+        {
+            float pp = fv * __half2float(g_svh[col]);
+            if (g_bias) pp += __half2float(g_bias[col]);
+            reinterpret_cast<__nv_bfloat16 *>(g_out)[(long)out_row * n + col] =
+                __float2bfloat16_rn(pp);
+            continue;
+        }
+        if (fv > 65504.f) fv = 65504.f; else if (fv < -65504.f) fv = -65504.f;
+        half h = __float2half_rn(fv);
+        float pp = __half2float(h) * __half2float(g_svh[col]);
+        if (pp > 65504.f) pp = 65504.f; else if (pp < -65504.f) pp = -65504.f;
+        h = __float2half_rn(pp);
+        if (g_bias)
+        {
+            float b2 = __half2float(h) + __half2float(g_bias[col]);
+            if (b2 > 65504.f) b2 = 65504.f; else if (b2 < -65504.f) b2 = -65504.f;
+            h = __float2half_rn(b2);
+        }
+        g_out[(long)out_row * n + col] = h;
+    }
+}
+
 void sgl_exl3_grouped_linear(
     at::Tensor x,                     // (P, k) fp16 pair rows, pre-had_in
     at::Tensor packed_ptrs,           // (E,) int64 device pointers
@@ -301,9 +509,11 @@ void sgl_exl3_grouped_linear(
     const int n = out.size(1);
     const int n16 = n / 16;
     const int col_blocks = n / 128;
+    const int ws_rows = (int)ws.size(3);
     TORCH_CHECK(ws.size(0) == col_blocks && ws.size(1) == splits &&
-                ws.size(2) == (long)E * chunks_cap && ws.size(3) == 16 && ws.size(4) == 128,
-                "exl3 grouped: workspace shape mismatch");
+                ws.size(2) == (long)E * chunks_cap &&
+                (ws_rows == 16 || ws_rows == 4) && ws.size(4) == 128,
+                "exl3 grouped: workspace shape mismatch (ws rows must be 16 or 4)");
     TORCH_CHECK(cnt_buf.size(0) == (long)E * col_blocks && cnt_buf.size(1) == chunks_cap,
                 "exl3 grouped: counter buffer shape mismatch");
     TORCH_CHECK(bits >= 1 && bits <= 8, "exl3 grouped: bitrate out of range");
@@ -322,19 +532,97 @@ void sgl_exl3_grouped_linear(
     half* op = reinterpret_cast<half *>(out.data_ptr());
     const int bf16_out = out.scalar_type() == at::kBFloat16 ? 1 : 0;
     int icb = (int)cb;
+    const int layout_b = (getenv("EXL3_PANEL_LAYOUT") != nullptr && getenv("EXL3_PANEL_LAYOUT")[0] == (char)66);
 
     dim3 grid(col_blocks, splits, E * chunks_cap);
+    if (ws_rows == 4)
+    {
+        switch (bits)
+        {
+        case 1: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<1, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<1, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 2: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<2, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<2, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 3: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<3, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<3, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 4: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<4, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<4, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 5: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<5, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<5, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 6: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<6, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<6, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 7: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<7, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<7, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 8: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<8, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<8, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        default: TORCH_CHECK(false, "exl3 grouped: bad bits");
+        }
+    }
+    else
+    {
+        switch (bits)
+        {
+        case 1: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<1, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<1, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 2: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<2, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<2, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 3: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<3, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<3, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 4: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<4, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<4, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 5: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<5, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<5, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 6: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<6, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<6, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 7: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<7, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<7, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 8: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<8, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<8, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        default: TORCH_CHECK(false, "exl3 grouped: bad bits");
+        }
+    }
+}
+
+void sgl_exl3_grouped_linear_direct(
+    at::Tensor x, at::Tensor packed_ptrs, at::Tensor svh_ptrs, at::Tensor bias_ptrs,
+    at::Tensor counts, at::Tensor offsets,
+    int64_t cb, int64_t bits_in, int64_t half_k_in, int64_t splits_in,
+    at::Tensor scratch, at::Tensor out)
+{
+    TORCH_CHECK(x.is_cuda() && counts.is_cuda() && offsets.is_cuda() && out.is_cuda(),
+                "exl3 grouped direct: CUDA tensors required");
+    TORCH_CHECK(x.scalar_type() == at::kHalf && counts.scalar_type() == at::kInt &&
+                offsets.scalar_type() == at::kLong &&
+                (out.scalar_type() == at::kHalf || out.scalar_type() == at::kBFloat16),
+                "exl3 grouped direct: fp16 x, int32 counts, int64 offsets, fp16/bf16 out required");
+    TORCH_CHECK(x.is_contiguous() && out.is_contiguous(), "exl3 grouped direct: contiguous required");
+    const int E = (int)packed_ptrs.size(0);
+    const int k = x.size(1);
+    const int bits = (int)bits_in;
+    const bool half_k = half_k_in != 0;
+    const int n = out.size(1);
+    const int n16 = n / 16;
+    const int col_blocks = n / 128;
+    TORCH_CHECK(bits >= 1 && bits <= 8, "exl3 grouped direct: bitrate out of range");
+    const at::cuda::OptionalCUDAGuard guard(x.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const uint16_t** packed_arr =
+        reinterpret_cast<const uint16_t**>(packed_ptrs.data_ptr<int64_t>());
+    const half** svh_arr = reinterpret_cast<const half**>(svh_ptrs.data_ptr<int64_t>());
+    const half** bias_arr = reinterpret_cast<const half**>(bias_ptrs.data_ptr<int64_t>());
+    const half* xp = reinterpret_cast<const half *>(x.data_ptr<at::Half>());
+    const int* counts_p = counts.data_ptr<int>();
+    const long* offsets_p = offsets.data_ptr<long>();
+    half* op = reinterpret_cast<half *>(out.data_ptr());
+    const int bf16_out = out.scalar_type() == at::kBFloat16 ? 1 : 0;
+    int icb = (int)cb;
+    const int layout_b = (getenv("EXL3_PANEL_LAYOUT") != nullptr && getenv("EXL3_PANEL_LAYOUT")[0] == (char)66);
+
+    int splits = (int)splits_in;
+    const int P = x.size(0);
+    dim3 grid(col_blocks, E, splits);
     switch (bits)
     {
-        case 1: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<1, true><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<1, false><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 2: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<2, true><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<2, false><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 3: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<3, true><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<3, false><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 4: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<4, true><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<4, false><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 5: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<5, true><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<5, false><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 6: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<6, true><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<6, false><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 7: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<7, true><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<7, false><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 8: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<8, true><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<8, false><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        default: TORCH_CHECK(false, "exl3 grouped: bad bits");
+        case 1: if (half_k) exl3::exl3_grouped_gemm_direct<1, true><<<grid, 256, 0, stream>>>(xp, packed_arr, counts_p, offsets_p, splits, k, n, n16, icb, layout_b, scratch.data_ptr<float>()); else exl3::exl3_grouped_gemm_direct<1, false><<<grid, 256, 0, stream>>>(xp, packed_arr, counts_p, offsets_p, splits, k, n, n16, icb, layout_b, scratch.data_ptr<float>()); break;
+        case 2: if (half_k) exl3::exl3_grouped_gemm_direct<2, true><<<grid, 256, 0, stream>>>(xp, packed_arr, counts_p, offsets_p, splits, k, n, n16, icb, layout_b, scratch.data_ptr<float>()); else exl3::exl3_grouped_gemm_direct<2, false><<<grid, 256, 0, stream>>>(xp, packed_arr, counts_p, offsets_p, splits, k, n, n16, icb, layout_b, scratch.data_ptr<float>()); break;
+        case 3: if (half_k) exl3::exl3_grouped_gemm_direct<3, true><<<grid, 256, 0, stream>>>(xp, packed_arr, counts_p, offsets_p, splits, k, n, n16, icb, layout_b, scratch.data_ptr<float>()); else exl3::exl3_grouped_gemm_direct<3, false><<<grid, 256, 0, stream>>>(xp, packed_arr, counts_p, offsets_p, splits, k, n, n16, icb, layout_b, scratch.data_ptr<float>()); break;
+        case 4: if (half_k) exl3::exl3_grouped_gemm_direct<4, true><<<grid, 256, 0, stream>>>(xp, packed_arr, counts_p, offsets_p, splits, k, n, n16, icb, layout_b, scratch.data_ptr<float>()); else exl3::exl3_grouped_gemm_direct<4, false><<<grid, 256, 0, stream>>>(xp, packed_arr, counts_p, offsets_p, splits, k, n, n16, icb, layout_b, scratch.data_ptr<float>()); break;
+        case 5: if (half_k) exl3::exl3_grouped_gemm_direct<5, true><<<grid, 256, 0, stream>>>(xp, packed_arr, counts_p, offsets_p, splits, k, n, n16, icb, layout_b, scratch.data_ptr<float>()); else exl3::exl3_grouped_gemm_direct<5, false><<<grid, 256, 0, stream>>>(xp, packed_arr, counts_p, offsets_p, splits, k, n, n16, icb, layout_b, scratch.data_ptr<float>()); break;
+        case 6: if (half_k) exl3::exl3_grouped_gemm_direct<6, true><<<grid, 256, 0, stream>>>(xp, packed_arr, counts_p, offsets_p, splits, k, n, n16, icb, layout_b, scratch.data_ptr<float>()); else exl3::exl3_grouped_gemm_direct<6, false><<<grid, 256, 0, stream>>>(xp, packed_arr, counts_p, offsets_p, splits, k, n, n16, icb, layout_b, scratch.data_ptr<float>()); break;
+        case 7: if (half_k) exl3::exl3_grouped_gemm_direct<7, true><<<grid, 256, 0, stream>>>(xp, packed_arr, counts_p, offsets_p, splits, k, n, n16, icb, layout_b, scratch.data_ptr<float>()); else exl3::exl3_grouped_gemm_direct<7, false><<<grid, 256, 0, stream>>>(xp, packed_arr, counts_p, offsets_p, splits, k, n, n16, icb, layout_b, scratch.data_ptr<float>()); break;
+        case 8: if (half_k) exl3::exl3_grouped_gemm_direct<8, true><<<grid, 256, 0, stream>>>(xp, packed_arr, counts_p, offsets_p, splits, k, n, n16, icb, layout_b, scratch.data_ptr<float>()); else exl3::exl3_grouped_gemm_direct<8, false><<<grid, 256, 0, stream>>>(xp, packed_arr, counts_p, offsets_p, splits, k, n, n16, icb, layout_b, scratch.data_ptr<float>()); break;
+        default: TORCH_CHECK(false, "exl3 grouped direct: bad bits");
     }
+    dim3 egrid(P, col_blocks);
+    exl3::exl3_grouped_epilogue<<<egrid, 32, 0, stream>>>(
+        scratch.data_ptr<float>(),
+        reinterpret_cast<const half**>(svh_ptrs.data_ptr<int64_t>()),
+        reinterpret_cast<const half**>(bias_ptrs.data_ptr<int64_t>()),
+        offsets.data_ptr<long>(), counts.data_ptr<int>(), E, n, op, bf16_out);
 }
 }  // namespace exl3
