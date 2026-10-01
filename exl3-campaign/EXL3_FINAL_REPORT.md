@@ -136,12 +136,24 @@ transport-fair).
 (4-9%, earlier), pair-indexed had_in (22x, shipped), workspace caching
 (+87% end-to-end, shipped), and an adaptive-splits A/B on the grid geometry
 — grid(32, splits, E*CH=256) is ~8x empty at decode, but splits=1 at small P
-measured **53% slower** (68.83 vs 98.97 tok/s): the empty z-blocks are cheap,
-the cost is expert-major weight streaming inside the active blocks (~421 GB/s
-effective on the trellis panels), and the k-parallel splits carry occupancy.
-splits=4 retained (A/B documented in-code, commit cc2bacc48a). The remaining
-gap is the trellis inner-loop decode cost per weight tile — a tensor-core-
-class kernel rewrite, the next campaign's opening item.
+measured **53% slower** (68.83 vs 98.97 tok/s): the empty z-blocks are cheap
+and the k-parallel splits carry occupancy. splits=4 retained (A/B documented
+in-code, commit cc2bacc48a).
+
+**P0 microbench (measured, refines the attribution)**: `p0_microbench.py`
+at the exact 3.75 shapes (E=64 local, K=4096, N=4096, bits 4 / 3-half):
+the grouped kernel streams at **~1.6 TB/s effective** in both uniform
+(64 experts x 1 pair: 536.9 MB in 333.8 µs) and skewed traffic — near half
+of HBM peak, so raw streaming efficiency is NOT the main gap. The measured
+waste is **pair-major weight re-reads**: each expert's panel is re-read once
+per pair (at decode's ~4 pairs/expert skew, that is ~4x the minimum weight
+traffic — 256 MB vs 64 MB per gate launch). The refined attribution: the
+grouped-GEMM gap = pair-major amplification (~4x, fixable by expert-major
+M<=4 tiling that decodes each panel tile once and applies all its pairs —
+a moderate kernel change reusing the existing decode inner loop) plus the
+trellis per-tile decode cost (the tensor-core-class item). This corrects
+the earlier ~421 GB/s estimate, which conflated amplification with
+streaming efficiency.
 
 **Item-1 disposition (RESOLVED BY MISSION TEXT; owner notified, rewrite
 campaign available on request)**: the literal "EXL3 >= native in every cell"
