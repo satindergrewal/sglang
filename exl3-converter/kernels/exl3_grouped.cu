@@ -293,7 +293,13 @@ __global__ void exl3_grouped_gemm_direct(
 
     const int cnt = g_counts[e];
     if (cnt <= 0) return;
-    int m = cnt; if (m > ROWS_PER_PASS) m = ROWS_PER_PASS;
+    // The last grid-y slot is the routing sentinel (remote pairs, NULL
+    // panels): never dereference it.
+    if (e == gridDim.y - 1) return;
+    // G=2: up to 32 pairs of this expert share ONE decoded weight tile per
+    // k-window (halves the decode chain's per-row cost vs the 16-row variant).
+    int m = cnt; if (m > 2 * ROWS_PER_PASS) m = 2 * ROWS_PER_PASS;
+    const int groups = (m + ROWS_PER_PASS - 1) / ROWS_PER_PASS;
     const int k16 = k >> 4;
     const int k_beg = (int)((long)k16 * ks / splits);
     const int k_end = (int)((long)k16 * (ks + 1) / splits);
@@ -304,11 +310,7 @@ __global__ void exl3_grouped_gemm_direct(
     const long pair_base = g_offsets[e];
     const int m0 = lane >> 2;
     const int m8 = m0 + 8;
-    const bool v0 = m0 < m;
-    const bool v8 = m8 < m;
     const int kp = (lane & 3) << 1;
-    const half* x0 = g_x + (pair_base + m0) * k;
-    const half* x8 = g_x + (pair_base + m8) * k;
 
     constexpr int n_words = BITS * 256 / 32;
     int wp0[8], wp1[8], ws0[8];
@@ -328,9 +330,9 @@ __global__ void exl3_grouped_gemm_direct(
         }
     }
 
-    FragC frag_c[2];
-    frag_c[0] = {};
-    frag_c[1] = {};
+    FragC frag_c[4];
+#pragma unroll
+    for (int g = 0; g < 2; g++) { frag_c[2 * g] = {}; frag_c[2 * g + 1] = {}; }
 
     for (int kk = k_beg; kk < k_end; kk++)
     {
@@ -359,23 +361,30 @@ __global__ void exl3_grouped_gemm_direct(
             }
         }
 
-        const half* x0k = x0 + kk * 16;
-        const half* x8k = x8 + kk * 16;
         const half z = __float2half(0.0f);
-        FragA fa;
-        fa.elems[0] = __halves2half2(v0 ? x0k[kp] : z, v0 ? x0k[kp + 1] : z);
-        fa.elems[1] = __halves2half2(v8 ? x8k[kp] : z, v8 ? x8k[kp + 1] : z);
-        fa.elems[2] = __halves2half2(v0 ? x0k[kp + 8] : z, v0 ? x0k[kp + 9] : z);
-        fa.elems[3] = __halves2half2(v8 ? x8k[kp + 8] : z, v8 ? x8k[kp + 9] : z);
-
         FragB fb0, fb1;
         fb0.elems[0] = __halves2half2(w[0], w[1]);
         fb0.elems[1] = __halves2half2(w[2], w[3]);
         fb1.elems[0] = __halves2half2(w[4], w[5]);
         fb1.elems[1] = __halves2half2(w[6], w[7]);
 
-        ptx_mma_m16n8k16(fa, fb0, frag_c[0]);
-        ptx_mma_m16n8k16(fa, fb1, frag_c[1]);
+#pragma unroll
+        for (int g = 0; g < 2; g++)
+        {
+            const int r_base = g * ROWS_PER_PASS;
+            if (r_base >= m) break;
+            const bool gv0 = (m0 + r_base) < m;
+            const bool gv8 = (m8 + r_base) < m;
+            const half* xa = g_x + (long)(pair_base + r_base + m0) * k + kk * 16;
+            const half* xb = g_x + (long)(pair_base + r_base + m8) * k + kk * 16;
+            FragA fa;
+            fa.elems[0] = __halves2half2(gv0 ? xa[kp] : z, gv0 ? xa[kp + 1] : z);
+            fa.elems[1] = __halves2half2(gv8 ? xb[kp] : z, gv8 ? xb[kp + 1] : z);
+            fa.elems[2] = __halves2half2(gv0 ? xa[kp + 8] : z, gv0 ? xa[kp + 9] : z);
+            fa.elems[3] = __halves2half2(gv8 ? xb[kp + 8] : z, gv8 ? xb[kp + 9] : z);
+            ptx_mma_m16n8k16(fa, fb0, frag_c[2 * g]);
+            ptx_mma_m16n8k16(fa, fb1, frag_c[2 * g + 1]);
+        }
     }
 
     // atomic-add the raw fp32 partials into the scratch (fragment layout:
@@ -383,19 +392,27 @@ __global__ void exl3_grouped_gemm_direct(
     const int c0 = (lane & 3) << 1;
     const int col0 = n_base + warp * 16 + c0;
     const int col1 = col0 + 8;
-    if (v0)
+#pragma unroll
+    for (int g = 0; g < 2; g++)
     {
-        atomicAdd(g_scratch + (long)(pair_base + m0) * n + col0,     frag_c[0].elems[0]);
-        atomicAdd(g_scratch + (long)(pair_base + m0) * n + col0 + 1, frag_c[0].elems[1]);
-        atomicAdd(g_scratch + (long)(pair_base + m0) * n + col1,     frag_c[1].elems[0]);
-        atomicAdd(g_scratch + (long)(pair_base + m0) * n + col1 + 1, frag_c[1].elems[1]);
-    }
-    if (v8)
-    {
-        atomicAdd(g_scratch + (long)(pair_base + m8) * n + col0,     frag_c[0].elems[2]);
-        atomicAdd(g_scratch + (long)(pair_base + m8) * n + col0 + 1, frag_c[0].elems[3]);
-        atomicAdd(g_scratch + (long)(pair_base + m8) * n + col1,     frag_c[1].elems[2]);
-        atomicAdd(g_scratch + (long)(pair_base + m8) * n + col1 + 1, frag_c[1].elems[3]);
+        const int r0g = g * ROWS_PER_PASS;
+        if (r0g >= m) break;
+        const int rm0 = r0g + m0;
+        const int rm8 = r0g + m8;
+        if (rm0 < m)
+        {
+            atomicAdd(g_scratch + (long)(pair_base + rm0) * n + col0,     frag_c[2 * g].elems[0]);
+            atomicAdd(g_scratch + (long)(pair_base + rm0) * n + col0 + 1, frag_c[2 * g].elems[1]);
+            atomicAdd(g_scratch + (long)(pair_base + rm0) * n + col1,     frag_c[2 * g + 1].elems[0]);
+            atomicAdd(g_scratch + (long)(pair_base + rm0) * n + col1 + 1, frag_c[2 * g + 1].elems[1]);
+        }
+        if (rm8 < m)
+        {
+            atomicAdd(g_scratch + (long)(pair_base + rm8) * n + col0,     frag_c[2 * g].elems[2]);
+            atomicAdd(g_scratch + (long)(pair_base + rm8) * n + col0 + 1, frag_c[2 * g].elems[3]);
+            atomicAdd(g_scratch + (long)(pair_base + rm8) * n + col1,     frag_c[2 * g + 1].elems[2]);
+            atomicAdd(g_scratch + (long)(pair_base + rm8) * n + col1 + 1, frag_c[2 * g + 1].elems[3]);
+        }
     }
 }
 

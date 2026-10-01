@@ -1221,21 +1221,24 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         col_blocks). rows = ws slab rows (16 full / 4 decode variant);
         chunks = pair-chunks per expert (rows*chunks = per-expert pair
         capacity the overflow check enforces). Zeros are restored in-kernel
-        after each launch, so reuse is graph-safe."""
+        after each launch, so reuse is graph-safe. E_op = the packed pointer
+        array length (global experts + sentinel) — the op derives E from it
+        and checks the ws dims against it."""
         gate_n = packed["gate_n"]
         down_n = packed["down_n"]
         dev = packed["gate_ptrs"].device
+        E_op = int(packed["gate_ptrs"].size(0))
         CH = chunks
         ws_by = {}
         cnt_by = {}
         for proj, n_out in (("gate", gate_n), ("up", gate_n), ("down", down_n)):
             cb_n = int(n_out // 128)
             ws_by[(proj, cb_n)] = torch.zeros(
-                (cb_n, splits, E * CH, rows, 128),
+                (cb_n, splits, E_op * CH, rows, 128),
                 dtype=torch.float32, device=dev)
             cnt_by[(proj, cb_n)] = torch.zeros(
-                (E * cb_n, CH), dtype=torch.int32, device=dev)
-        return (E, ws_by, cnt_by)
+                (E_op * cb_n, CH), dtype=torch.int32, device=dev)
+        return (E_op, ws_by, cnt_by)
 
     def _run_packed_moe_grouped(self, x, ids, wts, packed, out_dt,
                                 runner_config, E):
@@ -1249,6 +1252,17 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         rsf = runner_config.routed_scaling_factor
         wscale = comp * (rsf if rsf is not None else 1.0)
         dev = x.device
+        # Variant selection (measured): eager decode (P<=64) takes the
+        # direct atomic-split kernel (rows=4 ws / chunks=8 / splits=16 when
+        # the ws fallback path is chosen); captured graphs and prefill keep
+        # the rows=16 worst-case layout.
+        capturing = torch.cuda.is_current_stream_capturing()
+        use_direct = (P <= 64 and not capturing
+                      and os.environ.get("EXL3_MOE_NO_DIRECT") != "1")
+        if use_direct:
+            rows, chunks, splits_v = 4, 8, 16
+        else:
+            rows, chunks, splits_v = 16, 4, 4
 
 
         if _HAS_FUSED_ROUTE and P <= 512 and os.environ.get("EXL3_MOE_NO_FUSED_ROUTE") != "1":
@@ -1272,7 +1286,7 @@ class ExL3MoEMethod(FusedMoEMethodBase):
                 wts.reshape(-1).to(torch.float32).contiguous(),
                 E, K, wscale, x_pairs, pw)
             if (not torch.cuda.is_current_stream_capturing()
-                    and int(counts[:E].max().item()) > (32 if use_direct else rows * chunks)):
+                    and int(counts[:-1].max().item()) > (32 if use_direct else rows * chunks)):
                 raise MoEGroupedOverflow()
             CH = 4
         else:
@@ -1305,7 +1319,7 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             # SORTED order (pw is wts[order]); sids == key[order].
             pw = torch.where(sids < E, pw, torch.zeros_like(pw))
             if (not torch.cuda.is_current_stream_capturing()
-                    and int(counts[:E].max().item()) > (32 if use_direct else rows * chunks)):
+                    and int(counts[:-1].max().item()) > (32 if use_direct else rows * chunks)):
                 raise MoEGroupedOverflow()
 
             CH = 4
@@ -1324,18 +1338,13 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         # traffic, making splits=16 profitable (kernels restore zeros
         # in-place). Eager-only: the overflow check needs a host sync, and
         # captured graphs must keep the rows=16 worst-case layout.
-        capturing = torch.cuda.is_current_stream_capturing()
-        use_direct = P <= 64 and not capturing
-        if use_direct:
-            rows, chunks, splits_v = 4, 8, 16
-        else:
-            rows, chunks, splits_v = 16, 4, 4
         # ONE shared workspace set per (E, gate_n, down_n, splits, rows,
         # chunks, device) across all MoE layers: the shapes are
         # layer-identical. Per-layer persistence (47 x ~200 MB) OOMs the KV
         # pool, while per-step allocation re-fills ~200 MB of zeros every
         # layer every step (~50% of the decode step in GPU kernel time).
-        key = (E, packed["gate_n"], packed["down_n"], splits_v, rows, chunks,
+        E_op = int(packed["gate_ptrs"].size(0))
+        key = (E_op, packed["gate_n"], packed["down_n"], splits_v, rows, chunks,
                packed["gate_ptrs"].device.index)
         ws_cache = _GROUPED_WS_CACHE.get(key)
         if ws_cache is None:
@@ -1351,7 +1360,10 @@ class ExL3MoEMethod(FusedMoEMethodBase):
                 # checks above; zero_init is inherent (scratch.zero_()).
                 scratch = self._direct_scratch(dev, n_out)
                 scratch.zero_()
-                out = torch.empty((xp.shape[0], n_out), dtype=out_dt, device=dev)
+                # ZERO-init (not empty): rows owned by the routing sentinel
+                # (remote pairs, pw=0) are never written by the epilogue, and
+                # the combine's 0 x uninitialized-memory can be NaN.
+                out = torch.zeros((xp.shape[0], n_out), dtype=out_dt, device=dev)
                 torch.ops.sgl_exl3_grouped.grouped_linear_direct(
                     xp, packed[f"{proj}_ptrs"], packed[f"{proj}_svh_ptrs"],
                     packed[f"{proj}_bias_ptrs"], counts, offsets,
