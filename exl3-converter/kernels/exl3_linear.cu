@@ -556,7 +556,7 @@ __global__ void exl3_gemm_kernel_v3(
     const half* __restrict__ g_x,
     const uint16_t* __restrict__ g_packed,
     float* __restrict__ g_ws,          // (col_blocks, splits, m, n) fp32
-    int m, int k, int n, int n16, int cb, int splits)
+    int m, int k, int n, int n16, int cb, int splits, int layout_b)
 {
     constexpr int words16 = BITS * 16 + (HALF_K ? 8 : 0);
     const int t = threadIdx.x;
@@ -601,8 +601,11 @@ __global__ void exl3_gemm_kernel_v3(
 
     for (int kk = k_beg; kk < k_end; kk++)
     {
-        const uint32_t* tile32 =
-            (const uint32_t*)(g_packed + ((kk * n16) + col_block * 8 + warp) * words16);
+        const long stride = layout_b ? (long)8 * words16 : (long)n16 * words16;
+        const uint32_t* tile_base = (const uint32_t*)(g_packed +
+            (layout_b ? ((long)col_block * k16 + k_beg) * 8 * words16
+                      : ((long)k_beg * n16 + col_block * 8) * words16));
+        const uint32_t* tile32 = (const uint32_t*)(tile_base + (kk - k_beg) * stride);
         half w[8];
         if constexpr (HALF_K)
         {
@@ -810,14 +813,14 @@ void sgl_exl3_linear(
         dim3 grid(col_blocks, splits, m_groups);
         switch (bits)
         {
-            case 1: if (half_k) exl3::exl3_gemm_kernel_v3<1, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); else exl3::exl3_gemm_kernel_v3<1, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 2: if (half_k) exl3::exl3_gemm_kernel_v3<2, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); else exl3::exl3_gemm_kernel_v3<2, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 3: if (half_k) exl3::exl3_gemm_kernel_v3<3, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); else exl3::exl3_gemm_kernel_v3<3, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 4: if (half_k) exl3::exl3_gemm_kernel_v3<4, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); else exl3::exl3_gemm_kernel_v3<4, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 5: if (half_k) exl3::exl3_gemm_kernel_v3<5, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); else exl3::exl3_gemm_kernel_v3<5, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 6: if (half_k) exl3::exl3_gemm_kernel_v3<6, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); else exl3::exl3_gemm_kernel_v3<6, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 7: if (half_k) exl3::exl3_gemm_kernel_v3<7, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); else exl3::exl3_gemm_kernel_v3<7, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
-            case 8: if (half_k) exl3::exl3_gemm_kernel_v3<8, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); else exl3::exl3_gemm_kernel_v3<8, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits); break;
+            case 1: if (half_k) exl3::exl3_gemm_kernel_v3<1, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits, layout_b); else exl3::exl3_gemm_kernel_v3<1, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits, layout_b); break;
+            case 2: if (half_k) exl3::exl3_gemm_kernel_v3<2, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits, layout_b); else exl3::exl3_gemm_kernel_v3<2, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits, layout_b); break;
+            case 3: if (half_k) exl3::exl3_gemm_kernel_v3<3, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits, layout_b); else exl3::exl3_gemm_kernel_v3<3, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits, layout_b); break;
+            case 4: if (half_k) exl3::exl3_gemm_kernel_v3<4, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits, layout_b); else exl3::exl3_gemm_kernel_v3<4, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits, layout_b); break;
+            case 5: if (half_k) exl3::exl3_gemm_kernel_v3<5, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits, layout_b); else exl3::exl3_gemm_kernel_v3<5, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits, layout_b); break;
+            case 6: if (half_k) exl3::exl3_gemm_kernel_v3<6, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits, layout_b); else exl3::exl3_gemm_kernel_v3<6, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits, layout_b); break;
+            case 7: if (half_k) exl3::exl3_gemm_kernel_v3<7, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits, layout_b); else exl3::exl3_gemm_kernel_v3<7, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits, layout_b); break;
+            case 8: if (half_k) exl3::exl3_gemm_kernel_v3<8, MP, true><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits, layout_b); else exl3::exl3_gemm_kernel_v3<8, MP, false><<<grid, 256, 0, stream>>>(xp, packed_ptr, wsp, mi, ki, ni, n16i, icb, splits, layout_b); break;
             default: TORCH_CHECK(false, "exl3 linear: unsupported bitrate");
         }
         dim3 rgrid(col_blocks, (mi + 15) / 16);
