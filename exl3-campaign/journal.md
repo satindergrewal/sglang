@@ -1314,3 +1314,9 @@ Phase0 language DONE: fractional-K (KA+0.5) support added to python dequant (bit
 - Component budget at Phase-1 ship (no-draft TPOT 33.8ms): grouped MoE ~20ms (77µs×3×47 ≈ 10.9ms + dense-path exl3_gemm 5.3ms + had/route ~4ms), NCCL(SHM) 3.2ms, attention 0.9ms, misc. The native 14.3ms budget implies its MoE+dense kernels run ~2.3× cheaper — consistent with the mxfp4 LUT path's layout-friendly streaming.
 - Phase 1 remains SHIPPED: 101.69 tok/s fp8 no-draft (16/16, coherent), the daily on 8015 IS the direct-kernel build (28x).
 - **Phase-1 warm re-bench: 119.27 / 118.59 tok/s (TPOT 29.22ms)** — the cold-boot 101.69 undermeasured (first-run state). The representative Phase-1 number: **~119 tok/s = 52.5% of native** (from 43.6% pre-Phase-1 = +20% total). The daily on 8015 (28x) verified: health 200, 0 exceptions, coherent.
+
+## 2026-10-01 (Phase 2 prep) — LAYOUT HYPOTHESIS PROVEN: 1.55-1.62x from contiguous panel reads
+- Built `exl3_grouped_gemm_direct_b` (timing-only B-layout kernel, no epilogue) + a host-reordered panel copy: panel.view(k16, n16/8, 8, wb).permute(1,0,2,3) — fully contiguous per-block k-scans.
+- **MEASURED (real 3.75 panels, serve-skew counts): A=75.5/80.1/79.5/99.1/144.3µs vs B=45.8/47.4/55.4/62.5/105.4µs at P=16/32/64/128/256 → 1.55-1.62× at decode skew.** 64MB of panels at 48µs = 1.33TB/s (vs A's 865GB/s). The scattered 1KB panel reads of the (kk, n16-tile)-major converter layout cost exactly the predicted 1.6×.
+- **The converter-layout campaign is now data-justified**: pack_trellis writes the panel (kk, n16-tile)-major; a (col_block, kk)-major layout (the B experiment's reorder) recovers ~1.6× on EVERY grouped GEMM launch — projected no-draft: 119 → ~160-170 tok/s (grouped MoE 10.4 → ~6.5ms). The campaign = converter patch (pack_trellis layout switch + the B kernel reading it) + a 3.75 re-encode (8-12h) + gate re-run.
+- Committed: exl3_grouped.cu with the B experiment kernel + B host + registration (nvfp4-report).
