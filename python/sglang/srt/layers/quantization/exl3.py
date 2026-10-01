@@ -1377,6 +1377,19 @@ class ExL3MoEMethod(FusedMoEMethodBase):
                     packed[f"{proj}_cb"], packed[f"{proj}_bits"],
                     int(packed[f"{proj}_half_k"]), splits_v, scratch, out)
                 return out
+            if use_direct and int(packed[f"{proj}_cb"]) == 2 and not int(packed[f"{proj}_half_k"]):
+                # Decode-into-fragment direct (mul1 4-bit): the fused
+                # pair-decode fills the mma B-fragment registers directly
+                # (measured 1.22-1.29x vs the Phase-1 kernel at P=32/64).
+                scratch = self._direct_scratch(dev, n_out)
+                scratch.zero_()
+                out = torch.zeros((xp.shape[0], n_out), dtype=out_dt, device=dev)
+                torch.ops.sgl_exl3_grouped.grouped_linear_direct_f(
+                    xp, packed[f"{proj}_ptrs"], packed[f"{proj}_svh_ptrs"],
+                    packed[f"{proj}_bias_ptrs"], counts, offsets,
+                    packed[f"{proj}_cb"], packed[f"{proj}_bits"],
+                    int(packed[f"{proj}_half_k"]), splits_v, scratch, out)
+                return out
             if use_direct:
                 # Direct decode path: atomic-split partials into a zeroed
                 # fp32 scratch + fused epilogue; no workspace round-trip.
