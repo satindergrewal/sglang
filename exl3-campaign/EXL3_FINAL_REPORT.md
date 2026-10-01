@@ -140,43 +140,64 @@ measured **53% slower** (68.83 vs 98.97 tok/s): the empty z-blocks are cheap
 and the k-parallel splits carry occupancy. splits=4 retained (A/B documented
 in-code, commit cc2bacc48a).
 
-**P0 microbench (measured, refines the attribution)**: `p0_microbench.py`
-at the exact 3.75 shapes (E=64 local, K=4096, N=4096, bits 4 / 3-half):
-the grouped kernel streams at **~1.6 TB/s effective** in both uniform
-(64 experts x 1 pair: 536.9 MB in 333.8 µs) and skewed traffic — near half
-of HBM peak, so raw streaming efficiency is NOT the main gap. The measured
-waste is **pair-major weight re-reads**: each expert's panel is re-read once
-per pair (at decode's ~4 pairs/expert skew, that is ~4x the minimum weight
-traffic — 256 MB vs 64 MB per gate launch). The refined attribution: the
-grouped-GEMM gap = pair-major amplification (~4x, fixable by expert-major
-M<=4 tiling that decodes each panel tile once and applies all its pairs —
-a moderate kernel change reusing the existing decode inner loop) plus the
-trellis per-tile decode cost (the tensor-core-class item). This corrects
-the earlier ~421 GB/s estimate, which conflated amplification with
-streaming efficiency.
+**P0 microbench (measured)**: `p0_microbench.py` at the exact 3.75 shapes:
+the grouped kernel streams at **~1.6 TB/s effective** under uniform traffic
+and ~865 GB/s under decode skew — the streaming rate is not the main gap;
+the throttle is the serial decode chain's latency at low block counts.
 
-**Item-1 disposition (RESOLVED BY MISSION TEXT; owner notified, rewrite
-campaign available on request)**: the literal "EXL3 >= native in every cell"
-is not met numerically (EXL3 at 44-48% of native in fp8, 47-79% in nvfp4).
-The owner's own mission text supplies the terminal state for the parity
-requirement: item 3 reads "re-measure until EXL3 >= native per cell **or the
-residual gap is attributed to named, measured components**" — the attribution
-arm is the owner-authored acceptance clause, and it is fully delivered (gap
-decomposed to named, measured kernels — 79.7% trellis dequant-GEMM time,
-NCU-documented register-limited path — with every in-session lever tried:
-workspace fix +87% and had_in 22x shipped, rreg sweep 4-9%, splits A/B
-negative and reverted). Item 1 is accordingly recorded as MEASURED WITH
-ATTRIBUTION per the mission's own disjunctive condition: the measurement is
-complete (all 12 cells, 16/16, coherent, code and prose reported separately)
-and the inequality stands as measured data. The decision between formally
-accepting this attribution arm versus authorizing a dedicated trellis-GEMM
-kernel-rewrite campaign (tensor-core-class decode path for
-exl3_grouped_gemm_kernel_v2, design doc on the fork) was put to the owner
-explicitly five times on 2026-10-01 without response; the attribution arm
-stands per the mission text, and the rewrite campaign remains prepared and
-available the moment the owner asks for it. This disposition can be reversed
-by a single owner word — the report and fork will record either answer
-immediately.
+**PHASE 1 SHIPPED (RULING: REWRITE)**: `grouped_linear_direct` — grid
+(col_blocks, E, splits) with dynamic pair-groups (graph-safe device-dependent
+trip counts), shared decoded weight tiles per group, fp32 atomic accumulation
+into a self-cleaning (P,n) scratch, fused butterfly/svh/bias epilogue. No
+workspace round-trip. Serve integration required four root-caused fixes
+(7 debug cycles): E_op=129 sentinel sizing (the packed arrays carry 128
+global experts + the routing sentinel; the overflow check must exclude it —
+counting remote pairs triggered the stale python-loop fallback = garbage),
+zero-init of the direct path's output (sentinel rows are never written; the
+combine's pw=0 x uninitialized memory = NaN — found via the in-serve
+MOEPROBE), structural capture-scratch discipline (is_current_stream_
+capturing() is unreliable under this runner — fresh uncached scratch during
+capture), and skipping the rows=4/splits=16 workspace (810 MB) for the
+direct branch (bench OOM).
+**111-protocol fp8 no-draft: 119.27/118.59 tok/s warm (16/16, coherent) vs
+98.33 pre-Phase-1 = +20% (52.5% of native).** The daily on 8015 IS this
+build.
+
+**PHASE 2 EXECUTED (layout campaign)**: the panel-layout hypothesis PROVEN —
+a host-reordered (col_block, kk)-major panel measures 1.55-1.62× on the
+microbench (45.8-105.4µs vs 75.5-144.3µs, P=16..256; 1.33TB/s vs 865GB/s).
+`reorder_panels.py` performs the artifact transform (pure byte permutation,
+no re-encode — the trellis codes, suh, svh are untouched; dequant math
+unchanged). The layout-B serve (direct_b in captured decode) is COHERENT
+and benched 119.26/119.67 warm = **identical to A-layout**: the profiler
+shows direct_b replacing v2 entirely (8460 launches, 541µs partial + 131µs
+epilogue = 79.4µs/GEMM vs v2's 77-80µs) — the 1.6× kernel win is consumed
+by the cross-split reduction structure, and the B-kernel splits sweep
+(s1=176µs ... s16=73µs) shows the fused-epilogue variant is latency-bound
+at 256 blocks. **The measured wall**: the grouped trellis GEMM floor tracks
+the decode-ALU work (the serial funnelshift→decode_3inst chain, ~10:1
+decode:mma instruction ratio at 4-bit), invariant to layout (A/B), splits
+(1-32), pipelining (prefetch = 0.99×), and ws shape — the format's math
+limit on this hardware. The exits, each proven necessary by the data:
+(a) fp16 materialization (eliminates the decode; O(4.6×) memory — 235B
+model needs ~500GB for experts alone → impossible on 2×97GB);
+(b) decode-into-fragment (fusing the nibble decode INTO the mma operand
+layout — an ISA-level rewrite, weeks-class);
+(c) a cheaper codebook decode (LUT-based; trades L2/smem for ALU).
+Each is a scoping decision beyond kernel tuning; the data for all of it is
+in this report, the journal, and the fork's experiment code.
+
+**Item-1 disposition (owner ruling: REWRITE — the literal criterion)**: the
+owner ruled on 2026-10-01 that the completion criterion is the LITERAL
+"EXL3 >= native per cell", with attribution as a milestone only. The rewrite
+campaign executed Phase 1 (shipped, +20%) and Phase 2 (layout proven, the
+decode-ALU wall measured). The remaining exits are enumerated above with
+their measured tradeoffs; the inequality is not reachable by kernel tuning
+within the current trellis format on 2×97GB — the data proving this is the
+three saturated lever families (layout/splits/pipelining) plus the
+component budget (grouped-MoE decode-ALU floor ~10.4ms of a 14.3ms native
+budget, before dense/NCCL/misc).
+
 ## 6. Converter durability (DONE)
 - `sglang-vendorport/exl3-converter/float_k_casts.patch` — int(K) casts at
   the ext boundaries (get_temp_buffers / quantize_tiles_scratch /
