@@ -1351,14 +1351,18 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         # layer-identical. Per-layer persistence (47 x ~200 MB) OOMs the KV
         # pool, while per-step allocation re-fills ~200 MB of zeros every
         # layer every step (~50% of the decode step in GPU kernel time).
-        E_op = int(packed["gate_ptrs"].size(0))
-        key = (E_op, packed["gate_n"], packed["down_n"], splits_v, rows, chunks,
-               packed["gate_ptrs"].device.index)
-        ws_cache = _GROUPED_WS_CACHE.get(key)
-        if ws_cache is None:
-            ws_cache = self._grouped_ws_make(E, packed, splits_v, rows, chunks)
-            _GROUPED_WS_CACHE[key] = ws_cache
-        _, ws_by, cnt_by = ws_cache
+        if use_direct:
+            # the direct path carries its own scratch — no workspace
+            ws_by = cnt_by = None
+        else:
+            E_op = int(packed["gate_ptrs"].size(0))
+            key = (E_op, packed["gate_n"], packed["down_n"], splits_v, rows, chunks,
+                   packed["gate_ptrs"].device.index)
+            ws_cache = _GROUPED_WS_CACHE.get(key)
+            if ws_cache is None:
+                ws_cache = self._grouped_ws_make(E, packed, splits_v, rows, chunks)
+                _GROUPED_WS_CACHE[key] = ws_cache
+            _, ws_by, cnt_by = ws_cache
 
         def grouped_gemm(xp, proj, n_out, splits, zero_init=False):
             if use_direct:
