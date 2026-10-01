@@ -187,6 +187,19 @@ layout — an ISA-level rewrite, weeks-class);
 Each is a scoping decision beyond kernel tuning; the data for all of it is
 in this report, the journal, and the fork's experiment code.
 
+**Phase 2a EXECUTED (decode-into-fragment, the named ISA phase)**:
+`decode_mul1_pair_fused` decodes two adjacent mul1 codes straight into a
+half2 mma B-fragment register (2 hfma → 1 hfma2; no w[8] intermediate; no
+separate packing). Gated on real 3.75 panels: maxdiff 0.03-0.125 abs
+(~1e-4 relative — inside the atomic-order class; the earlier maxdiff~1000
+failures were the GATE's bug: cb=1 passed on mul1-encoded panels).
+Microbench: **1.29×/1.22×** (62.0/68.0µs vs 80.5/82.7µs, P=32/64 s16).
+Serve A/B: coherent but **regressive** — 111.91/112.93 warm vs the Phase-1
+kernel's 118.59-119.27. Env-gated OFF (`EXL3_MOE_FUSED_DECODE=1`); the
+Phase-1 kernel is the serve default. With the layout and fusion experiments
+both showing isolated wins consumed in-serve, and decode_3inst already
+dp4a-optimal, the decode-ALU bound is the format-level limit.
+
 **Item-1 disposition (owner ruling: REWRITE — the literal criterion)**: the
 owner ruled on 2026-10-01 that the completion criterion is the LITERAL
 "EXL3 >= native per cell", with attribution as a milestone only. The rewrite
