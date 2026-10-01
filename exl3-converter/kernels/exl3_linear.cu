@@ -756,6 +756,7 @@ void sgl_exl3_linear(
     int icb = (int)cb;
     int mi = m, ki = k, ni = n, n16i = n16;
     const int bf16_out = out.scalar_type() == at::kBFloat16 ? 1 : 0;
+    const int layout_b = (getenv("EXL3_PANEL_LAYOUT") != nullptr && getenv("EXL3_PANEL_LAYOUT")[0] == (char)66);
 
     if (m <= 16)
     {
