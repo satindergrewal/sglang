@@ -26,8 +26,8 @@ for P in (16, 32, 64, 128):
     out_a = torch.empty(P, N, dtype=torch.half, device=dev)
     out_f = torch.empty(P, N, dtype=torch.half, device=dev)
     # Phase-1 kernel needs svh/bias pointers for its epilogue
-    GLD(x, mk(ptrs), mk(sptrs), mk(bptrs), counts, offsets, 1, 4, 0, 16, torch.zeros(P, N, dtype=torch.float32, device=dev), out_a)
-    GLF(x, mk(ptrs), mk(sptrs), mk(bptrs), counts, offsets, 1, 4, 0, 16, torch.zeros(P, N, dtype=torch.float32, device=dev), out_f)
+    GLD(x, mk(ptrs), mk(sptrs), mk(bptrs), counts, offsets, 2, 4, 0, 16, torch.zeros(P, N, dtype=torch.float32, device=dev), out_a)
+    GLF(x, mk(ptrs), mk(sptrs), mk(bptrs), counts, offsets, 2, 4, 0, 16, torch.zeros(P, N, dtype=torch.float32, device=dev), out_f)
     torch.cuda.synchronize()
     bit = torch.equal(out_a, out_f)
     d = (out_a.float() - out_f.float()).abs().max().item()
@@ -47,10 +47,10 @@ for P in (32, 64):
         scratch = torch.zeros(P, N, dtype=torch.float32, device=dev)
         out = torch.empty(P, N, dtype=torch.half, device=dev)
         for _ in range(5):
-            scratch.zero_(); op(x, mk(ptrs), mk(sptrs), mk(bptrs), counts, offsets, 1, 4, 0, 16, scratch, out)
+            scratch.zero_(); op(x, mk(ptrs), mk(sptrs), mk(bptrs), counts, offsets, 2, 4, 0, 16, scratch, out)
         torch.cuda.synchronize(); t0 = time.perf_counter()
         for _ in range(200):
-            scratch.zero_(); op(x, mk(ptrs), mk(sptrs), mk(bptrs), counts, offsets, 1, 4, 0, 16, scratch, out)
+            scratch.zero_(); op(x, mk(ptrs), mk(sptrs), mk(bptrs), counts, offsets, 2, 4, 0, 16, scratch, out)
         torch.cuda.synchronize(); t = (time.perf_counter() - t0) / 200 * 1e6
         res[tag] = t
     print(f"P={P}: phase1={res['phase1']:.1f}us fused={res['fused']:.1f}us speedup={res['phase1']/res['fused']:.2f}x", flush=True)
