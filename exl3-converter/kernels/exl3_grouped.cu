@@ -73,7 +73,7 @@ __global__ void exl3_grouped_gemm_kernel_v2(
     int chunks_cap,
     int k, int n, int n16, int cb, int splits,
     half* __restrict__ g_out,        // (P, n)
-    int bf16_out)
+    int bf16_out, int layout_b)
 {
     constexpr int words16 = BITS * 16 + (HALF_K ? 8 : 0);
     const int t = threadIdx.x;
@@ -132,10 +132,14 @@ __global__ void exl3_grouped_gemm_kernel_v2(
     frag_c[0] = {};
     frag_c[1] = {};
 
+    const long pstride = layout_b ? (long)8 * words16 : (long)n16 * words16;
+    const uint32_t* tile_base = (const uint32_t*)(g_packed +
+        (layout_b ? ((long)col_block * k16 + k_beg) * 8 * words16
+                  : ((long)k_beg * n16 + col_block * 8) * words16));
     for (int kk = k_beg; kk < k_end; kk++)
     {
         const uint32_t* tile32 =
-            (const uint32_t*)(g_packed + ((kk * n16) + col_block * 8 + warp) * words16);
+            (const uint32_t*)(tile_base + (kk - k_beg) * pstride);
 
         half w[8];
         if constexpr (HALF_K)
@@ -789,6 +793,7 @@ void sgl_exl3_grouped_linear(
     const int n16 = n / 16;
     const int col_blocks = n / 128;
     const int ws_rows = (int)ws.size(3);
+    const int layout_b = (getenv("EXL3_PANEL_LAYOUT") != nullptr && getenv("EXL3_PANEL_LAYOUT")[0] == (char)66);
     TORCH_CHECK(ws.size(0) == col_blocks && ws.size(1) == splits &&
                 ws.size(2) == (long)E * chunks_cap &&
                 (ws_rows == 16 || ws_rows == 4) && ws.size(4) == 128,
@@ -817,14 +822,14 @@ void sgl_exl3_grouped_linear(
     {
         switch (bits)
         {
-        case 1: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<1, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<1, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 2: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<2, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<2, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 3: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<3, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<3, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 4: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<4, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<4, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 5: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<5, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<5, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 6: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<6, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<6, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 7: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<7, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<7, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 8: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<8, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<8, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
+        case 1: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<1, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<1, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 2: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<2, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<2, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 3: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<3, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<3, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 4: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<4, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<4, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 5: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<5, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<5, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 6: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<6, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<6, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 7: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<7, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<7, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 8: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<8, true, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<8, false, 4><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
         default: TORCH_CHECK(false, "exl3 grouped: bad bits");
         }
     }
@@ -832,14 +837,14 @@ void sgl_exl3_grouped_linear(
     {
         switch (bits)
         {
-        case 1: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<1, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<1, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 2: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<2, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<2, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 3: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<3, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<3, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 4: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<4, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<4, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 5: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<5, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<5, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 6: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<6, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<6, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 7: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<7, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<7, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
-        case 8: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<8, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); else exl3::exl3_grouped_gemm_kernel_v2<8, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out); break;
+        case 1: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<1, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<1, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 2: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<2, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<2, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 3: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<3, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<3, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 4: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<4, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<4, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 5: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<5, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<5, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 6: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<6, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<6, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 7: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<7, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<7, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
+        case 8: if (half_k) exl3::exl3_grouped_gemm_kernel_v2<8, true, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); else exl3::exl3_grouped_gemm_kernel_v2<8, false, 16><<<grid, 256, 0, stream>>>(xp, packed_arr, svh_arr, bias_arr, wsp, cp, counts_p, offsets_p, chunks_cap, k, n, n16, icb, splits, op, bf16_out, layout_b); break;
         default: TORCH_CHECK(false, "exl3 grouped: bad bits");
         }
     }
