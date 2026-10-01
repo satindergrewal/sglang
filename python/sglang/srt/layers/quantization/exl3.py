@@ -1211,9 +1211,11 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         decode path. Zeroed by the caller per launch. NEVER allocated during
         graph capture — a capture-time allocation is owned by that graph's
         memory pool and must not be reused elsewhere."""
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("exl3 direct: scratch allocation during capture")
         key = (str(dev), n)
+        # during capture: FRESH uncached scratch — the graph's memory pool
+        # owns it, so there is no cross-graph aliasing
+        if torch.cuda.is_current_stream_capturing():
+            return torch.zeros(64, n, dtype=torch.float32, device=dev)
         buf = _DIRECT_SCRATCH_CACHE.get(key)
         if buf is None:
             buf = torch.zeros(64, n, dtype=torch.float32, device=dev)
