@@ -1208,7 +1208,11 @@ class ExL3MoEMethod(FusedMoEMethodBase):
 
     def _direct_scratch(self, dev, n):
         """Cached (64, n) fp32 atomic-accumulation scratch for the direct
-        decode path (P <= 64 eager). Zeroed by the caller per launch."""
+        decode path. Zeroed by the caller per launch. NEVER allocated during
+        graph capture — a capture-time allocation is owned by that graph's
+        memory pool and must not be reused elsewhere."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("exl3 direct: scratch allocation during capture")
         key = (str(dev), n)
         buf = _DIRECT_SCRATCH_CACHE.get(key)
         if buf is None:
@@ -1256,8 +1260,10 @@ class ExL3MoEMethod(FusedMoEMethodBase):
         # direct atomic-split kernel (rows=4 ws / chunks=8 / splits=16 when
         # the ws fallback path is chosen); captured graphs and prefill keep
         # the rows=16 worst-case layout.
-        capturing = torch.cuda.is_current_stream_capturing()
-        use_direct = (P <= 64 and not capturing
+        # The direct kernel is capture-safe (dynamic group loop, no host
+        # syncs, self-cleaning scratch); the P<=64 bound limits it to decode
+        # shapes where it wins — larger P stays on the v2 split path.
+        use_direct = (P <= 64
                       and os.environ.get("EXL3_MOE_NO_DIRECT") != "1")
         if use_direct:
             rows, chunks, splits_v = 4, 8, 16
@@ -1285,8 +1291,8 @@ class ExL3MoEMethod(FusedMoEMethodBase):
                 x, order, tok, sids,
                 wts.reshape(-1).to(torch.float32).contiguous(),
                 E, K, wscale, x_pairs, pw)
-            if (not torch.cuda.is_current_stream_capturing()
-                    and int(counts[:-1].max().item()) > (32 if use_direct else rows * chunks)):
+            if (not use_direct and not torch.cuda.is_current_stream_capturing()
+                    and int(counts[:-1].max().item()) > rows * chunks):
                 raise MoEGroupedOverflow()
             CH = 4
         else:
@@ -1318,8 +1324,8 @@ class ExL3MoEMethod(FusedMoEMethodBase):
             # rows contribute nothing at the combine. The mask must follow the
             # SORTED order (pw is wts[order]); sids == key[order].
             pw = torch.where(sids < E, pw, torch.zeros_like(pw))
-            if (not torch.cuda.is_current_stream_capturing()
-                    and int(counts[:-1].max().item()) > (32 if use_direct else rows * chunks)):
+            if (not use_direct and not torch.cuda.is_current_stream_capturing()
+                    and int(counts[:-1].max().item()) > rows * chunks):
                 raise MoEGroupedOverflow()
 
             CH = 4
