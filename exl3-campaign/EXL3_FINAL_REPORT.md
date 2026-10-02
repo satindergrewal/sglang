@@ -19,7 +19,12 @@ time by the box power-cycle (see §7); they fill in on the next box session.
   expert samples incl. 3.0-bit and 3.5-bit downs; wikitext ppl **6.48** vs
   native **6.42**; KLD ~0.02 median; greedy match on factual prompts;
   exllamav3 reference runtime generates "Paris" end-to-end from the artifact.
-- Serves on 8015 as THE daily (image `exl3-grouped-20260928n`).
+- Served on 8015 as the EXL3 daily through 2026-10-02 (boot_lb6.sh: image 28x
+  + bind-mounted fixed .so set + patched runner + EXL3_PANEL_LAYOUT=B +
+  --served-model-name mimo + --tool-call-parser mimo). On 2026-10-02 the user
+  swapped the 8015 daily to the native long-context serve (§2.1) after the
+  EXL3 serve showed planning-loop behavior on agentic tasks (§3.4); the EXL3
+  daily remains one command away (boot_lb6.sh).
 
 ### 1.2 EXL3 4.0bpw artifact (superseded)
 - `/mnt/nvme0/work-exl3/mimo40/out` (2.3M-token era). Stored last-layer
@@ -54,6 +59,40 @@ variants carry the same pools per drafter. EXL3 cells: image 28u; native:
 28v; the daily is `boot_fallback_shm.sh` (SHM env is mandatory on this box —
 see §7).
 
+### 2.1 CURRENT daily (2026-10-02): native fp8-KV 1M-token long-context serve
+`boot_fp8kv_1m.sh` (port 8015, container exl-native, image 28v) — user's
+daily, confirmed working in real agentic use. Flags beyond the §2 baseline:
+`--mem-fraction-static 0.94 --max-total-tokens 1048576 --max-running-requests 64
+--swa-full-tokens-ratio 0.02 --chunked-prefill-size 8192
+--cuda-graph-max-bs-decode 48 --kv-cache-dtype fp8_e4m3
+--moe-runner-backend flashinfer_mxfp4 --served-model-name mimo
+--tool-call-parser mimo` (default attention backend).
+**max_total_num_tokens = 1,048,576** (verified; 6.84 GB still free), health
+200, chat + tool_calls (stream and non-stream) verified, and a real
+977,409-token needle-in-haystack processed end-to-end with the needle
+retrieved at 97% depth. Full-1M prefill is minutes-scale (~1.2K tok/s at
+chunk 4096; ~2x at the shipped 8192); control script:
+`/mnt/nvme0/work-exl3/mimo-serve.sh {start|stop|restart|status|logs}`.
+
+The 1M pool required finding two hidden memory consumers (each OOM'd as
+something else in the tracebacks):
+1. **req_to_token pool = max_running_requests × context_len × 4 B** — the
+   default 2048 × 1,048,576 × 4 = **8.6 GB per GPU**. `--max-running-requests 64`
+   shrinks it to 268 MB. (This is the generic SGLang sizing rule for
+   long-context serves on small-pool budgets.)
+2. **--swa-full-tokens-ratio defaults to 0.8**: the SWA sub-pool was sized to
+   74K tokens for a model whose SWA window is 128 tokens (MiMo-V2.6: 10 full
+   + 38 SWA layers). 0.02 frees ~22 KB/token of pool budget.
+
+Preserved alternatives: EXL3 daily `boot_lb6.sh` (§1.1); the TRUE nvfp4-KV
+native config `boot_nvfp4_8015.sh` — boots and generates plain text but is
+condemned for chat (§3.2). Tool-call parsing note: the image ships a
+dedicated MiMo function-call detector registered as parser name "mimo"
+(function_call/mimo_detector.py; format = the tool-call begin/end markers
+with `<function=NAME>` / `<parameter=key>` bodies, matching the chat
+template exactly); without `--tool-call-parser mimo` the markers pass
+through as raw content.
+
 ## 3. The measured matrix — 111 protocol
 `sglang.bench_serving --backend sglang-oai-chat --random-input-len 256
 --random-output-len 64 --num-prompts 16 --max-concurrency 4`
@@ -76,6 +115,30 @@ pending re-bench on this config.
 | none | 63.91 | 50.40 | 78.9% |
 | DFlash2 (block 7, fp8 draft KV) | 252.82 | 118.75 | 47.0% |
 | EAGLE 3/1/4 (radix ON) | 96.73 | 69.36 | 71.7% |
+
+**CHAT-GATE CAVEAT (2026-10-02): the nvfp4 cells were measured on the raw
+111 protocol only. Their first chat-templated check FAILS them**: on the
+native nvfp4 no-draft serve, chat completions degenerate at temperature 0
+AND temperature 1 (reasoning = the role-marker token repeated, empty
+content), and raw prompts containing the chat framing special tokens loop
+on fence tokens — while plain-text raw generation stays fluent. Root-cause
+class: 4-bit e2m1 KV crushes the KV of special-token/sink positions,
+destroying the framing attention the chat format depends on. The nvfp4-KV
+cells are NOT usable as chat/agent serves; keep them for raw-protocol
+benchmarks only (config preserved: boot_nvfp4_8015.sh). The EXL3-side nvfp4
+cells were not chat-checked (same failure class expected).
+
+### 3.4 The "looping" failure mode on agentic tasks (measured 2026-10-02)
+The user reported the EXL3 daily looping on an agentic task (re-stating the
+same plan across turns, never committing the file-write). Direct probe at
+temperature 0 (3000-token budget, same task): NO token-level repetition —
+the entire budget went to elaborate reasoning, zero content, on the EXL3
+serve AND identically on the native fp8-KV serve (10.5 KB reasoning, 0
+content). The failure mode is the MODEL's low-temperature planning
+attractor, not EXL3 quantization damage (3.75-bit noise may deepen it).
+Serve-side artifacts are all verified good: tool-call parsing (structured
+tool_calls, stream + non-stream), the served alias, coherence. The
+user-facing lever is sampling temperature.
 
 ### 3.3 EAGLE with radix cache ON — FIXED AND MEASURED
 Both targets bench 16/16 with ZERO exceptions with radix ON (the fix stack:
@@ -242,24 +305,25 @@ budget, before dense/NCCL/misc).
   RMA territory); until then `boot_fallback_shm.sh` is THE daily launcher.
   Grub pinned to kernel 7.0.0-31.
 - Fork pushes: `satindergrewal/sglang` branches `nvfp4-report`
-  (through 66272dc54c) and `exl3-native-support` (f2528b3459). Nothing
-  upstream/public.
+  (through 66272dc54c), `exl3-native-support` (through 8f01aa18b1 — layout-B
+  end-to-end kernels/loader + M4/P3 measurement assets), and
+  `exl3-campaign-docs` (through 5859e41195 — journal, report, all current
+  boot scripts + the mimo-serve.sh control script). Nothing upstream/public.
 - Local (LilMonkey): exact 28p image pulled from the box; artifact +
   native-drafter subset copied for TP1 smoke tests while the box is down.
 
 ## 8. Session runbook (next box session)
-0. **If 2-rank NCCL still hangs at "Init parallel begin" after the cold
-   cycle:** relaunch with `boot_fallback_shm.sh` — docker env
-   `NCCL_P2P_DISABLE=1 NCCL_CUMEM_ENABLE=0` forces SHM staging through host
-   memory (the copy-engine path is proven healthy). NOTE: earlier "P2P
-   disabled still hangs" evidence was invalid — `NCCL_P2P=0/DISABLE` are not
-   valid NCCL 2.30 knobs and were silently ignored; the SHM path is untested.
-   Numbers taken under SHM transport get a transport caveat in §3.
-1. Power-cycle box → `/tmp/boot_lb5.sh` (layout-B daily; boots image 28x with bind-mounted fixed .so + patched runner on the out375 artifact) → chat-templated "hi" + raw probe → pool number.
-2. `boot_eagle28p.sh` → coherence + 111 bench EAGLE radix-ON (EXL3 cell).
-   If coherent: re-run native EAGLE radix-ON. If garbage (decode-path
-   staleness): add decode-side prefix guard, rebuild, retest.
-3. nvfp4 KV cells: EXL3-3.75 none/DFlash/EAGLE + native counterparts.
+0. Serve lifecycle is user-facing now: `/mnt/nvme0/work-exl3/mimo-serve.sh
+   {start|stop|restart|status|logs}` manages the native fp8-KV 1M daily
+   (container exl-native, port 8015, config = boot_fp8kv_1m.sh). Status
+   prints health + the max_total_num_tokens line; a failed boot surfaces the
+   real errors. As of 2026-10-02 (evening) the user STOPPED the serve — the
+   box is intentionally without a running serve; boot with the script above.
+1. EXL3 daily when needed: `boot_lb6.sh` (layout-B, alias + tool parser).
+2. EAGLE follow-ups per §4 (decode-side staleness decision) via
+   boot_eagle28p.sh.
+3. DFlash2/EAGLE EXL3 cells still pending re-bench on the layout-B config
+   (§3.1); nvfp4 cells chat-condemned (§3.2) — raw-protocol numbers only.
 4. Decode profile (§5 scripts), parity fixes per component, re-bench.
 5. Fill §2 pools and §3 matrix, update this report, push to fork.
 
@@ -290,3 +354,15 @@ under identical load and diff the component tables.
 - The 3.75 artifact ships no audio tower: serves must pass
   --json-model-override-args '{"enable_multimodal": false}' (boot scripts
   carry it).
+- nvfp4-KV serves fail the chat gate (§3.2): 4-bit e2m1 KV degenerates
+  chat-templated generation at any temperature; raw-protocol benches only.
+- The 1M-token daily caps max_running_requests at 64 (the req_to_token pool
+  scales max_running × context_len × 4 B — 2048 requests would cost 8.6
+  GB/GPU, §2.1); concurrency beyond 64 queues.
+- Full-1M-token prefills are minutes-scale on this stack (chunked prefill,
+  SWA-hybrid attention); agent-scale contexts (10–100K) are seconds to tens
+  of seconds.
+- Model-level (not serve-level): at temperature 0 the model can enter a
+  planning attractor on long agentic tasks, burning the whole budget in
+  reasoning without committing an action — reproduced identically on the
+  native fp8-KV and EXL3 serves (§3.4). Lever: sampling temperature.
